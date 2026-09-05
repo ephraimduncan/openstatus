@@ -1,4 +1,4 @@
-import type { z } from "@hono/zod-openapi";
+import { z } from "@hono/zod-openapi";
 import type { selectMonitorSchema } from "@openstatus/db/src/schema";
 import {
   type DNSPayloadSchema,
@@ -148,6 +148,7 @@ export function getCheckerUrl(
     data: false,
   },
 ): string {
+  assertHostedCheckerAvailable();
   switch (monitor.jobType) {
     case "http":
     case "tcp":
@@ -160,5 +161,14 @@ export function getCheckerUrl(
         code: "BAD_REQUEST",
         message: `Invalid jobType '${monitor.jobType}'`,
       });
+  }
+}
+
+export function assertHostedCheckerAvailable(): void {
+  if (z.stringbool().prefault("false").parse(process.env.SELF_HOST)) {
+    throw new OpenStatusApiError({
+      code: "FORBIDDEN",
+      message: "Hosted checks are unavailable on self-hosted instances",
+    });
   }
 }

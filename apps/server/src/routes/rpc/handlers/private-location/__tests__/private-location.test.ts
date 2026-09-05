@@ -1,16 +1,21 @@
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import { db, eq } from "@openstatus/db";
 import {
   monitor,
   privateLocation,
   privateLocationToMonitors,
+  selectWorkspaceSchema,
   workspace,
 } from "@openstatus/db/src/schema";
 import { getLimits } from "@openstatus/db/src/schema/plan/utils";
+import { PrivateLocationService } from "@openstatus/proto/private_location/v1";
 import { expect } from "@std/expect";
 import { afterAll, beforeAll, describe, test } from "@std/testing/bdd";
 import { nanoid } from "nanoid";
 
 import { app } from "../../../../../index";
+import { RPC_CONTEXT_KEY } from "../../../interceptors";
+import { privateLocationServiceImpl } from "../index";
 
 async function connectRequest(
   method: string,
@@ -288,6 +293,63 @@ describe("PrivateLocationService.CreatePrivateLocation", () => {
 });
 
 describe("PrivateLocationService.GetPrivateLocation", () => {
+  test("read-only keys can list summaries but cannot retrieve agent tokens", async () => {
+    const ownWorkspace = selectWorkspaceSchema.parse(
+      await db.query.workspace.findFirst({
+        where: eq(workspace.id, entitledWorkspaceId),
+      }),
+    );
+    for (const scope of ["read", "write"] as const) {
+      const client = createClient(
+        PrivateLocationService,
+        createRouterTransport(
+          (router) =>
+            router.service(PrivateLocationService, privateLocationServiceImpl),
+          {
+            router: {
+              interceptors: [
+                (next) => (req) => {
+                  req.contextValues.set(RPC_CONTEXT_KEY, {
+                    workspace: ownWorkspace,
+                    requestId: `${TEST_PREFIX}-scope`,
+                    apiKey: { id: `${TEST_PREFIX}-${scope}`, scopes: [scope] },
+                  });
+                  return next(req);
+                },
+              ],
+            },
+          },
+        ),
+      );
+      const summaries = await client.listPrivateLocations({});
+      const summary = summaries.privateLocations.find(
+        (location) => location.id === String(testLocationId),
+      );
+      expect(summary).toMatchObject({
+        name: `${TEST_PREFIX}-main`,
+        monitorCount: 1,
+      });
+      expect(summary).not.toHaveProperty("token");
+
+      if (scope === "read") {
+        await expect(
+          client.getPrivateLocation({ id: String(testLocationId) }),
+        ).rejects.toMatchObject({ code: Code.PermissionDenied });
+      } else {
+        const result = await client.getPrivateLocation({
+          id: String(testLocationId),
+        });
+        const stored = await db.query.privateLocation.findFirst({
+          where: eq(privateLocation.id, testLocationId),
+        });
+        expect(result.privateLocation?.token).toBe(stored?.token);
+        expect(result.privateLocation?.monitorIds).toEqual([
+          String(testMonitorId),
+        ]);
+      }
+    }
+  });
+
   test("returns the location including its token", async () => {
     const res = await connectRequest(
       "GetPrivateLocation",

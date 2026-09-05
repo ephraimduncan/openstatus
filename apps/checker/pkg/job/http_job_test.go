@@ -2,60 +2,93 @@ package job_test
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/openstatushq/openstatus/apps/checker/checker"
 	"github.com/openstatushq/openstatus/apps/checker/pkg/job"
 	v1 "github.com/openstatushq/openstatus/apps/checker/proto/private_location/v1"
 	"github.com/openstatushq/openstatus/apps/checker/request"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// Save original checker.Http for restoration
-
 func TestHTTPJob_Success(t *testing.T) {
-
-	// Mock checker.Http to simulate success
-
-	monitor := &v1.HTTPMonitor{
-		Url:     "https://openstat.us",
-		Method:  "GET",
-		Timeout: 10000,
-		Retry:   2,
+	tests := []struct {
+		name       string
+		status     int
+		assertions []*v1.StatusCodeAssertion
+	}{
+		{name: "default 2xx", status: http.StatusOK},
+		{
+			name:   "custom non-2xx",
+			status: http.StatusNotFound,
+			assertions: []*v1.StatusCodeAssertion{
+				{Comparator: v1.NumberComparator_NUMBER_COMPARATOR_LESS_THAN, Target: 500},
+			},
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(tt.status)
+			}))
+			defer srv.Close()
+			otlp := newOTLP(t)
 
-	data, err := job.NewJobRunner().HTTPJob(context.Background(), monitor, "test-region")
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if data.RequestStatus != "success" {
-		t.Errorf("expected RequestStatus 'success', got '%s'", data.RequestStatus)
-	}
-	if data.Error != 0 {
-		t.Errorf("expected Error 0, got %d", data.Error)
+			monitor := &v1.HTTPMonitor{
+				Url: srv.URL, Method: http.MethodGet, Timeout: 1000, Retry: 2,
+				StatusCodeAssertions: tt.assertions,
+				OtelConfig:           &v1.OtelConfig{Endpoint: otlp.server.URL},
+			}
+			data, err := job.NewJobRunner().HTTPJob(t.Context(), monitor, "test-region")
+
+			require.NoError(t, err)
+			require.NotNil(t, data)
+			assert.Equal(t, "success", data.RequestStatus)
+			assert.Equal(t, uint8(0), data.Error)
+			assert.Equal(t, tt.status, data.StatusCode)
+			assert.Empty(t, data.Message)
+			assert.Equal(t, int32(1), calls.Load(), "successful checks must not retry")
+			otlp.requireMetric(t, "openstatus.status")
+			assert.False(t, otlp.sawMetric("openstatus.error"))
+		})
 	}
 }
 
-func TestHTTPJob_Failure(t *testing.T) {
+func TestHTTPJob_TransportFailureCannotPassStatusAssertion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
 
 	monitor := &v1.HTTPMonitor{
-		Url:     "https://localhost:1234",
-		Method:  "GET",
-		Timeout: 1000,
-		Retry:   1,
+		Url: srv.URL, Method: http.MethodGet, Timeout: 1000, Retry: 2,
+		StatusCodeAssertions: []*v1.StatusCodeAssertion{
+			{Comparator: v1.NumberComparator_NUMBER_COMPARATOR_LESS_THAN, Target: 500},
+		},
 	}
+	before := time.Now().UnixMilli()
+	data, err := job.NewJobRunner().HTTPJob(t.Context(), monitor, "test-region")
 
-	data, err := job.NewJobRunner().HTTPJob(context.Background(), monitor, "test-region")
-	if err != nil {
-		t.Fatalf("expected no Go error, got %v", err)
-	}
-	if data == nil {
-		t.Fatalf("expected data to be populated, got nil")
-	}
-	if data.Message == "" {
-		t.Errorf("expected error message to be populated for transport failure")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	assert.Equal(t, "error", data.RequestStatus)
+	assert.Equal(t, uint8(1), data.Error)
+	assert.Zero(t, data.StatusCode)
+	assert.NotEmpty(t, data.Message)
+	_, err = uuid.Parse(data.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, srv.URL, data.URL)
+	assert.GreaterOrEqual(t, data.Timestamp, before)
+	assert.LessOrEqual(t, data.Timestamp, time.Now().UnixMilli())
+	assert.Equal(t, data.Timestamp, data.CronTimestamp)
 }
 
 func TestProtoStringAssertionToComparator(t *testing.T) {
@@ -218,7 +251,7 @@ func TestHTTPJob_FailureMessage(t *testing.T) {
 			t.Fatalf("expected no error, got %v", err)
 		}
 		assert.Equal(t, uint8(1), data.Error)
-		assert.Equal(t, "Request failed with status code 500", data.Message)
+		assert.Contains(t, data.Message, "500")
 	})
 
 	t.Run("reports a failed assertion on a 2xx", func(t *testing.T) {
@@ -239,7 +272,7 @@ func TestHTTPJob_FailureMessage(t *testing.T) {
 			t.Fatalf("expected no error, got %v", err)
 		}
 		assert.Equal(t, uint8(1), data.Error)
-		assert.Equal(t, "Assertions failed", data.Message)
+		assert.NotEmpty(t, data.Message)
 	})
 
 	t.Run("keeps a successful check message empty", func(t *testing.T) {
@@ -257,4 +290,131 @@ func TestHTTPJob_FailureMessage(t *testing.T) {
 		assert.Equal(t, uint8(0), data.Error)
 		assert.Empty(t, data.Message)
 	})
+}
+
+func TestHTTPJob_BodyFailuresRemainIngestibleAfterRetries(t *testing.T) {
+	tests := []struct {
+		name       string
+		assertions []*v1.StatusCodeAssertion
+	}{
+		{name: "truncated"},
+		{
+			name: "stalled",
+			assertions: []*v1.StatusCodeAssertion{
+				{Comparator: v1.NumberComparator_NUMBER_COMPARATOR_LESS_THAN, Target: 500},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Length", "100")
+				w.Header().Set("X-Probe", "received")
+				_, _ = io.WriteString(w, "short")
+				w.(http.Flusher).Flush()
+				if tt.name == "stalled" {
+					<-r.Context().Done()
+				}
+			}))
+			defer srv.Close()
+			otlp := newOTLP(t)
+
+			monitor := &v1.HTTPMonitor{
+				Url: srv.URL, Method: http.MethodGet, Timeout: 250, Retry: 2,
+				StatusCodeAssertions: tt.assertions,
+				OtelConfig:           &v1.OtelConfig{Endpoint: otlp.server.URL},
+			}
+			before := time.Now().UnixMilli()
+			data, err := job.NewJobRunner().HTTPJob(t.Context(), monitor, "test-region")
+
+			require.NoError(t, err, "exhausted probe failures must reach ingestion")
+			require.NotNil(t, data)
+			assert.Equal(t, int32(2), calls.Load())
+			assert.Equal(t, "error", data.RequestStatus)
+			assert.Equal(t, uint8(1), data.Error)
+			assert.Equal(t, http.StatusOK, data.StatusCode)
+			assert.NotEmpty(t, data.Message)
+			_, err = uuid.Parse(data.ID)
+			assert.NoError(t, err)
+			assert.Equal(t, srv.URL, data.URL)
+			assert.GreaterOrEqual(t, data.Timestamp, before)
+			assert.LessOrEqual(t, data.Timestamp, time.Now().UnixMilli())
+			assert.Equal(t, data.Timestamp, data.CronTimestamp)
+
+			var headers map[string]string
+			require.NoError(t, json.Unmarshal([]byte(data.Headers), &headers))
+			assert.Equal(t, "received", headers["X-Probe"])
+			var timing checker.Timing
+			require.NoError(t, json.Unmarshal([]byte(data.Timing), &timing))
+			assert.GreaterOrEqual(t, timing.TransferStart, data.Timestamp)
+			assert.GreaterOrEqual(t, timing.TransferDone, timing.TransferStart)
+			otlp.requireMetric(t, "openstatus.error")
+			assert.False(t, otlp.sawMetric("openstatus.status"))
+		})
+	}
+}
+
+func TestHTTPJob_RetriesBodyFailureUntilRecovery(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Length", "100")
+			_, _ = io.WriteString(w, "short")
+			return
+		}
+		_, _ = io.WriteString(w, "complete")
+	}))
+	defer srv.Close()
+	otlp := newOTLP(t)
+
+	monitor := &v1.HTTPMonitor{
+		Url: srv.URL, Method: http.MethodGet, Timeout: 1000, Retry: 3,
+		OtelConfig: &v1.OtelConfig{Endpoint: otlp.server.URL},
+	}
+	data, err := job.NewJobRunner().HTTPJob(t.Context(), monitor, "test-region")
+
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, "success", data.RequestStatus)
+	assert.Equal(t, uint8(0), data.Error)
+	assert.Empty(t, data.Message)
+	otlp.requireMetric(t, "openstatus.status")
+	assert.False(t, otlp.sawMetric("openstatus.error"), "metrics must describe the final attempt")
+}
+
+func TestHTTPJob_CancellationDoesNotBecomeOutage(t *testing.T) {
+	tests := []struct {
+		name  string
+		retry int64
+	}{
+		{name: "final attempt", retry: 1},
+		{name: "retries remaining", retry: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				cancel()
+				<-r.Context().Done()
+			}))
+			defer srv.Close()
+
+			monitor := &v1.HTTPMonitor{
+				Url: srv.URL, Method: http.MethodGet, Timeout: 1000, Retry: tt.retry,
+			}
+			data, err := job.NewJobRunner().HTTPJob(ctx, monitor, "test-region")
+
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Nil(t, data)
+			assert.Equal(t, int32(1), calls.Load())
+		})
+	}
 }

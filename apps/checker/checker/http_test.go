@@ -5,9 +5,12 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/openstatushq/openstatus/apps/checker/checker"
 	"github.com/openstatushq/openstatus/apps/checker/request"
@@ -96,6 +99,41 @@ func Test_ping(t *testing.T) {
 			if tt.name == "Wrong url should return an error" && got.Error == "" {
 				t.Errorf("Expected Response.Error to be populated for transport failure")
 			}
+		})
+	}
+}
+
+func TestHttp_BodyFailuresPreserveResponse(t *testing.T) {
+	for _, name := range []string{"truncated", "stalled"} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "100")
+				w.Header().Set("X-Probe", "received")
+				_, _ = io.WriteString(w, "short")
+				w.(http.Flusher).Flush()
+				if name == "stalled" {
+					<-r.Context().Done()
+				}
+			}))
+			defer srv.Close()
+
+			client := srv.Client()
+			client.Timeout = 250 * time.Millisecond
+			before := time.Now().UnixMilli()
+			res, err := checker.Http(t.Context(), client, request.HttpCheckerRequest{
+				URL: srv.URL, Method: http.MethodGet,
+			})
+
+			require.NoError(t, err, "body failures must be reportable probe results")
+			require.NotEmpty(t, res.Error)
+			assert.Equal(t, http.StatusOK, res.Status)
+			assert.Equal(t, "received", res.Headers["X-Probe"])
+			assert.Equal(t, "short", res.Body)
+			assert.GreaterOrEqual(t, res.Timestamp, before)
+			assert.LessOrEqual(t, res.Timestamp, time.Now().UnixMilli())
+			assert.GreaterOrEqual(t, res.Latency, int64(0))
+			assert.GreaterOrEqual(t, res.Timing.TransferStart, res.Timestamp)
+			assert.GreaterOrEqual(t, res.Timing.TransferDone, res.Timing.TransferStart)
 		})
 	}
 }

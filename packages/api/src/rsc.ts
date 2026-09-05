@@ -38,8 +38,7 @@ export function createServerHelpers(opts: {
   const getContext = cache(async () => {
     const incoming = await headers();
     return createTRPCContext({
-      // NextRequest derives `cookies` from the cookie header, and `ctx.req` is
-      // only ever read for cookies and headers.
+      // RSC has no URL; the proxy forwards verified query passwords as cookies.
       req: new NextRequest("http://rsc.internal", {
         headers: new Headers(incoming),
       }),

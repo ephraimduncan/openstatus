@@ -1,5 +1,8 @@
 import "./test-preload.ts";
-import { selectNotificationSchema } from "@openstatus/db/src/schema";
+import {
+  type Monitor,
+  selectNotificationSchema,
+} from "@openstatus/db/src/schema";
 import { EmailClient } from "@openstatus/emails/src/client";
 import {
   afterEach,
@@ -14,8 +17,11 @@ import {
 
 import { sendAlert, sendDegraded, sendRecovery } from "./index";
 
-// biome-ignore lint/suspicious/noExplicitAny: stub over the EmailClient method
-let sendMonitorAlertMock: Stub<any>;
+let sendMonitorAlertMock: Stub<
+  EmailClient,
+  Parameters<EmailClient["sendMonitorAlert"]>,
+  Promise<void>
+>;
 
 describe("Email Notifications", () => {
   beforeEach(() => {
@@ -28,16 +34,34 @@ describe("Email Notifications", () => {
     sendMonitorAlertMock.restore();
   });
 
-  const createMockMonitor = () => ({
-    id: "monitor-1",
+  const createMockMonitor = (): Monitor => ({
+    id: 1,
     name: "API Health Check",
     url: "https://api.example.com/health",
-    jobType: "http" as const,
-    periodicity: "5m" as const,
-    status: "active" as const,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    region: "iad",
+    periodicity: "5m",
+    jobType: "http",
+    active: true,
+    public: true,
+    createdAt: null,
+    updatedAt: null,
+    regions: ["iad"],
+    description: "",
+    headers: [],
+    body: "",
+    workspaceId: 1,
+    timeout: 45000,
+    degradedAfter: null,
+    assertions: null,
+    status: "active",
+    method: "GET",
+    deletedAt: null,
+    otelEndpoint: null,
+    otelHeaders: [],
+    followRedirects: false,
+    retry: 3,
+    externalName: null,
+    grpcService: null,
+    grpcTls: null,
   });
 
   const createMockNotification = () => ({
@@ -57,7 +81,6 @@ describe("Email Notifications", () => {
     );
 
     await sendAlert({
-      // @ts-expect-error
       monitor,
       notification,
       statusCode: 500,
@@ -87,7 +110,6 @@ describe("Email Notifications", () => {
     );
 
     await sendAlert({
-      // @ts-expect-error
       monitor,
       notification,
       cronTimestamp: Date.now(),
@@ -107,7 +129,6 @@ describe("Email Notifications", () => {
     );
 
     await sendRecovery({
-      // @ts-expect-error
       monitor,
       notification,
       statusCode: 200,
@@ -133,7 +154,6 @@ describe("Email Notifications", () => {
     );
 
     await sendDegraded({
-      // @ts-expect-error
       monitor,
       notification,
       statusCode: 503,
@@ -151,7 +171,28 @@ describe("Email Notifications", () => {
     expect(callArgs.region).toBe("Los Angeles, California, USA");
   });
 
-  test("Handles invalid notification data gracefully", async () => {
+  for (const [type, send] of [
+    ["alert", sendAlert],
+    ["recovery", sendRecovery],
+    ["degraded", sendDegraded],
+  ] as const) {
+    test(`${type} keeps a private location label in the email`, async () => {
+      await send({
+        monitor: createMockMonitor(),
+        notification: selectNotificationSchema.parse(createMockNotification()),
+        regions: ["Office — London"],
+        cronTimestamp: 1_780_000_000_000,
+      });
+
+      assertSpyCalls(sendMonitorAlertMock, 1);
+      expect(sendMonitorAlertMock.calls[0].args[0].region).toBe(
+        "Office — London",
+      );
+      expect(sendMonitorAlertMock.calls[0].args[0].type).toBe(type);
+    });
+  }
+
+  test("rejects invalid email configuration instead of reporting a successful send", async () => {
     const monitor = createMockMonitor();
     const invalidNotification = selectNotificationSchema.parse({
       id: 1,
@@ -163,14 +204,14 @@ describe("Email Notifications", () => {
       data: '{"invalid":"data"}',
     });
 
-    await sendAlert({
-      // @ts-expect-error
-      monitor,
-      notification: invalidNotification,
-      cronTimestamp: Date.now(),
-    });
+    await expect(
+      sendAlert({
+        monitor,
+        notification: invalidNotification,
+        cronTimestamp: Date.now(),
+      }),
+    ).rejects.toThrow();
 
-    // Should not call sendMonitorAlert when data is invalid
     assertSpyCalls(sendMonitorAlertMock, 0);
   });
 });

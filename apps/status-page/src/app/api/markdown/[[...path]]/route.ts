@@ -1,4 +1,4 @@
-import { cookies, headers } from "next/headers";
+import { TRPCError } from "@trpc/server";
 import { type NextRequest, NextResponse } from "next/server";
 
 import {
@@ -12,13 +12,11 @@ import {
   parseMarkdownPath,
 } from "../../../../content/markdown";
 import { getBaseUrl } from "../../../../lib/base-url";
-import { resolveClientIp } from "../../../../lib/http/client-ip";
 import { resolveMarkdownResponse } from "../../../../lib/http/markdown-response";
-import { type GatePage, resolveGate } from "../../../../lib/proxy/resolve-gate";
-import { getQueryClient, trpc } from "../../../../lib/trpc/server";
+import { createStatusPageCaller } from "../../../../lib/trpc/server";
 
-// Match the feed route: getQueryClient/httpBatchLink needs Node, not Edge.
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 const PLAIN = "text/plain; charset=utf-8";
 
@@ -63,36 +61,14 @@ export async function GET(
     if (!target) return textResponse("Not Found", 404);
 
     const source = request.headers.get("x-md-source");
-    const queryClient = getQueryClient();
-    const url = new URL(request.url);
-    const cookieStore = await cookies();
-    const headerStore = await headers();
-    const clientIp = resolveClientIp(headerStore);
-
-    // Returns a response when the gate denies, null when it passes.
-    async function denyResponse(gatePage: GatePage) {
-      const gate = await resolveGate({
-        page: gatePage,
-        queryClient,
-        url,
-        cookieStore,
-        clientIp,
-      });
-      return gate.ok ? null : textResponse(gate.body, gate.status);
-    }
+    const caller = await createStatusPageCaller(request);
 
     switch (target.kind) {
-      // List pages render from `get`, which also carries the access fields — so
-      // we gate off the same payload instead of a second full-graph getLight.
       case "overview":
       case "monitors":
       case "events": {
-        const page = await queryClient.fetchQuery(
-          trpc.statusPage.get.queryOptions({ slug }),
-        );
+        const page = await caller.get({ slug });
         if (!page) return textResponse("Not Found", 404);
-        const denied = await denyResponse(page);
-        if (denied) return denied;
 
         const baseUrl = getBaseUrl({
           slug: page.slug,
@@ -124,14 +100,12 @@ export async function GET(
         const showUptime = page.configuration?.uptime ?? true;
         // Per-day uptime series (Tinybird) — only after the gate passes.
         const uptime =
-          (await queryClient.fetchQuery(
-            trpc.statusPage.getUptime.queryOptions({
-              slug,
-              pageComponentIds: page.pageComponents.map((c) => c.id.toString()),
-              cardType,
-              barType,
-            }),
-          )) ?? [];
+          (await caller.getUptime({
+            slug,
+            pageComponentIds: page.pageComponents.map((c) => c.id.toString()),
+            cardType,
+            barType,
+          })) ?? [];
         return markdownResponse(
           request,
           generateOverview(page, uptime, baseUrl, showUptime),
@@ -140,18 +114,11 @@ export async function GET(
           page.accessType,
         );
       }
-      // Detail pages: the detail queries don't carry access fields, so gate via
-      // getGate — a narrow access-only query — before fetching the (heavier)
-      // detail payload.
       case "monitor":
       case "report":
       case "maintenance": {
-        const light = await queryClient.fetchQuery(
-          trpc.statusPage.getGate.queryOptions({ slug }),
-        );
+        const light = await caller.getGate({ slug });
         if (!light) return textResponse("Not Found", 404);
-        const denied = await denyResponse(light);
-        if (denied) return denied;
 
         const baseUrl = getBaseUrl({
           slug: light.slug,
@@ -159,9 +126,7 @@ export async function GET(
         });
 
         if (target.kind === "monitor") {
-          const monitor = await queryClient.fetchQuery(
-            trpc.statusPage.getMonitor.queryOptions({ slug, id: target.id }),
-          );
+          const monitor = await caller.getMonitor({ slug, id: target.id });
           if (!monitor) return textResponse("Not Found", 404);
           return markdownResponse(
             request,
@@ -175,9 +140,7 @@ export async function GET(
           );
         }
         if (target.kind === "report") {
-          const report = await queryClient.fetchQuery(
-            trpc.statusPage.getReport.queryOptions({ slug, id: target.id }),
-          );
+          const report = await caller.getReport({ slug, id: target.id });
           if (!report) return textResponse("Not Found", 404);
           return markdownResponse(
             request,
@@ -190,9 +153,10 @@ export async function GET(
             light.accessType,
           );
         }
-        const maintenance = await queryClient.fetchQuery(
-          trpc.statusPage.getMaintenance.queryOptions({ slug, id: target.id }),
-        );
+        const maintenance = await caller.getMaintenance({
+          slug,
+          id: target.id,
+        });
         if (!maintenance) return textResponse("Not Found", 404);
         return markdownResponse(
           request,
@@ -207,6 +171,11 @@ export async function GET(
       }
     }
   } catch (error) {
+    if (error instanceof TRPCError) {
+      if (error.code === "UNAUTHORIZED")
+        return textResponse("Unauthorized", 401);
+      if (error.code === "FORBIDDEN") return textResponse("Forbidden", 403);
+    }
     console.error("Error serving status-page markdown:", error);
     return textResponse("Internal Server Error", 500);
   }

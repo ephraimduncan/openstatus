@@ -1,6 +1,7 @@
 "use client";
 
 import type { RouterOutputs } from "@openstatus/api";
+import { createProtectedCookieKey } from "@openstatus/api/src/auth/protected";
 import { Inbox } from "@openstatus/icons";
 import {
   StatusUpdates as BlockStatusUpdates,
@@ -23,11 +24,9 @@ import {
 import { useCookieState } from "@openstatus/ui/hooks/use-cookie-state";
 import { cn } from "@openstatus/ui/lib/utils";
 import { useExtracted } from "next-intl";
-import { useParams } from "next/navigation";
 import { useState } from "react";
 
 import { getBaseUrl } from "../../lib/base-url";
-import { createProtectedCookieKey } from "../../lib/protected";
 import {
   FormSubscribeEmail,
   type FormValues,
@@ -69,11 +68,9 @@ export function StatusUpdates({
 }: StatusUpdatesProps) {
   const t = useExtracted();
   const [success, setSuccess] = useState(false);
-  const params = useParams();
-  const domain = typeof params.domain === "string" ? params.domain : "";
   // The password lives in the cookie this browser set at login — not in the
   // page payload, which intentionally omits it.
-  const [password] = useCookieState(createProtectedCookieKey(domain));
+  const [password] = useCookieState(createProtectedCookieKey(page?.slug ?? ""));
 
   if (types.length === 0) return null;
 

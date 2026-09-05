@@ -15,7 +15,7 @@ export default async function Layout({
   const queryClient = getQueryClient();
   const { domain } = await params;
   await queryClient.prefetchQuery(
-    trpc.statusPage.get.queryOptions({ slug: domain }),
+    trpc.statusPage.getGate.queryOptions({ slug: domain }),
   );
 
   return (

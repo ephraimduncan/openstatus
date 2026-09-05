@@ -18,6 +18,9 @@ SELECT
 FROM mv__http_1d__v0
 WHERE
     monitorId IN {{ Array(monitorIds, 'String', '1,666') }}
+    {% if fromDate %} AND time >= parseDateTimeBestEffortOrNull({{ String(fromDate) }}) {% end %}
+    {% if toDate %} AND time <= parseDateTimeBestEffortOrNull({{ String(toDate) }}) {% end %}
+    {% if regions %} AND region IN {{ Array(regions, 'String', 'ams,fra') }} {% end %}
 GROUP BY h, monitorId
 ORDER BY h ASC
 

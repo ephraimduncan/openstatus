@@ -5,7 +5,6 @@ import {
   primaryKey,
   sqliteTable,
   text,
-  uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 
 import { monitor } from "../monitors";
@@ -42,13 +41,17 @@ export const notificationTrigger = sqliteTable(
       { onDelete: "cascade" },
     ),
     cronTimestamp: integer("cron_timestamp").notNull(),
+    status: text("status", { enum: ["pending", "sent"] })
+      .notNull()
+      .default("sent"),
+    payload: text("payload"),
+    leaseToken: text("lease_token"),
+    leaseExpiresAt: integer("lease_expires_at"),
   },
   (table) => [
-    uniqueIndex("notification_id_monitor_id_crontimestampe").on(
-      table.notificationId,
-      table.monitorId,
-      table.cronTimestamp,
-    ),
+    index("notification_trigger_pending_idx")
+      .on(table.monitorId, table.cronTimestamp)
+      .where(sql`${table.status} = 'pending'`),
   ],
 );
 

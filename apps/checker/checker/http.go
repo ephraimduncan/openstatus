@@ -149,27 +149,21 @@ func Http(ctx context.Context, client *http.Client, inputData request.HttpChecke
 
 	timing.TransferDone = time.Now().UTC().UnixMilli()
 
-	if err != nil {
-		return Response{
-			Latency:   latency,
-			Timing:    timing,
-			Timestamp: start.UTC().UnixMilli(),
-			Error:     fmt.Sprintf("Cannot read response body: %s", err.Error()),
-		}, err
-	}
-
 	headers := make(map[string]string)
 	for key := range response.Header {
 		headers[key] = response.Header.Get(key)
 	}
 
-	return Response{
+	result := Response{
 		Timestamp: start.UTC().UnixMilli(),
 		Status:    response.StatusCode,
 		Headers:   headers,
 		Timing:    timing,
 		Latency:   latency,
 		Body:      string(body),
-	}, nil
-
+	}
+	if err != nil {
+		result.Error = fmt.Sprintf("Cannot read response body: %s", err.Error())
+	}
+	return result, nil
 }

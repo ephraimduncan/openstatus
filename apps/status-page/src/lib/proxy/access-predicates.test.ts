@@ -1,11 +1,10 @@
-import { expect } from "@std/expect";
-import { describe, test } from "@std/testing/bdd";
-
 import {
   isEmailDomainAuthorized,
   isIpAuthorized,
   isPasswordAuthorized,
-} from "./access-predicates";
+} from "@openstatus/api/src/auth/access-predicates";
+import { expect } from "@std/expect";
+import { describe, test } from "@std/testing/bdd";
 
 describe("isPasswordAuthorized", () => {
   test("matching cookie authorizes", () => {

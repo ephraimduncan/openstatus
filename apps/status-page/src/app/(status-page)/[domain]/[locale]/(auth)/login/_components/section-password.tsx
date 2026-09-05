@@ -1,10 +1,11 @@
 "use client";
 
+import { createProtectedCookieKey } from "@openstatus/api/src/auth/protected";
 import { Button } from "@openstatus/ui/components/ui/button";
 import { useCookieState } from "@openstatus/ui/hooks/use-cookie-state";
 import { useMutation } from "@tanstack/react-query";
 import { useExtracted } from "next-intl";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import {
   Section,
@@ -13,15 +14,13 @@ import {
   SectionTitle,
 } from "../../../../../../../components/content/section";
 import { FormPassword } from "../../../../../../../components/forms/form-password";
-import { createProtectedCookieKey } from "../../../../../../../lib/protected";
 import { useTRPC } from "../../../../../../../lib/trpc/client";
 
-export function SectionPassword() {
+export function SectionPassword({ slug }: { slug: string }) {
   const t = useExtracted();
-  const { domain } = useParams<{ domain: string }>();
   const searchParams = useSearchParams();
   const trpc = useTRPC();
-  const [_, setPassword] = useCookieState(createProtectedCookieKey(domain));
+  const [_, setPassword] = useCookieState(createProtectedCookieKey(slug));
   const router = useRouter();
   const verifyPasswordMutation = useMutation(
     trpc.statusPage.verifyPassword.mutationOptions({}),
@@ -40,7 +39,7 @@ export function SectionPassword() {
           id="password-form"
           onSubmit={async (values) => {
             const result = await verifyPasswordMutation.mutateAsync({
-              slug: domain,
+              slug,
               password: values.password,
             });
             if (result) {

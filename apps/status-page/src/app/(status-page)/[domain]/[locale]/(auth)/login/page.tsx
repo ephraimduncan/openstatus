@@ -11,11 +11,11 @@ export default function LoginPage() {
   const { domain } = useParams<{ domain: string }>();
   const trpc = useTRPC();
   const { data: page } = useQuery(
-    trpc.statusPage.get.queryOptions({ slug: domain }),
+    trpc.statusPage.getGate.queryOptions({ slug: domain }),
   );
 
   if (page?.accessType === "password") {
-    return <SectionPassword />;
+    return <SectionPassword slug={page.slug} />;
   }
 
   if (page?.accessType === "email-domain") {

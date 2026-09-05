@@ -1,6 +1,5 @@
 import { getLogger } from "@logtape/logtape";
-import { and, db, eq, inArray, schema } from "@openstatus/db";
-import { incidentTable } from "@openstatus/db/src/schema";
+import { and, db, eq, inArray, schema, sql } from "@openstatus/db";
 import { monitorRegions } from "@openstatus/db/src/schema/constants";
 import {
   monitorStatusSchema,
@@ -11,9 +10,8 @@ import { z } from "zod";
 
 import { env } from "../env";
 import type { Env } from "../index";
-import { checkerAudit } from "../utils/audit-log";
-import { triggerNotifications, upsertMonitorStatus } from "./alerting";
-import { findOpenIncident, resolveIncident } from "./incident-utils";
+import { enqueueNotifications, triggerNotifications } from "./alerting";
+import { applyMonitorStatus, publishStatusAudit } from "./incident-utils";
 import { updateStatusPrivate } from "./private-location";
 
 export const checkerRoute = new Hono<Env>();
@@ -39,11 +37,7 @@ checkerRoute.post("/updateStatus", async (c) => {
     return c.text("Unauthorized", 401);
   }
 
-  const event = c.get("event");
-  const json = await c.req.json();
-
-  const result = payloadSchema.safeParse(json);
-
+  const result = payloadSchema.safeParse(await c.req.json());
   if (!result.success) {
     return c.text("Unprocessable Entity", 422);
   }
@@ -58,250 +52,123 @@ checkerRoute.post("/updateStatus", async (c) => {
     latency,
   } = result.data;
 
-  logger.info("Updating monitor status", {
-    monitor_id: monitorId,
-    region,
-    status,
-    status_code: statusCode,
-    cron_timestamp: cronTimestamp,
-    latency_ms: latency,
-  });
-
-  // First we upsert the monitor status
-  await upsertMonitorStatus({
-    monitorId: monitorId,
-    status,
-    region: region,
-  });
-
-  const currentMonitor = await db
-    .select()
-    .from(schema.monitor)
-    .where(eq(schema.monitor.id, Number(monitorId)))
-    .get();
-
-  const monitor = selectMonitorSchema.parse(currentMonitor);
-  const numberOfRegions = monitor.regions.length;
-
-  // Fetch all affected regions for notifications (single query)
-  const affectedRegions = await db
-    .select({ region: schema.monitorStatusTable.region })
-    .from(schema.monitorStatusTable)
-    .where(
-      and(
-        eq(schema.monitorStatusTable.monitorId, monitor.id),
-        eq(schema.monitorStatusTable.status, status),
-        inArray(schema.monitorStatusTable.region, monitor.regions),
-      ),
-    )
-    .all();
-
-  const affectedRegionsList = affectedRegions.map((r) => r.region);
-  const affectedRegionCount = affectedRegionsList.length;
-
-  event.status_update = {
-    status: result.data.status,
-    message: result.data.message,
-    region: result.data.region,
-    status_code: result.data.statusCode,
-    cron_timestamp: result.data.cronTimestamp,
-    latency_ms: result.data.latency,
-    affectedRegionsCount: affectedRegionCount,
-    monitorId: monitor.id,
-  };
-
-  if (affectedRegionCount === 0) {
-    return c.json({ success: true }, 200);
-  }
-
-  // audit log the current state of the ping
-
-  switch (status) {
-    case "active":
-      await checkerAudit.publishAuditLog({
-        id: `monitor:${monitorId}`,
-        action: "monitor.recovered",
-        targets: [{ id: monitorId, type: "monitor" }],
-        metadata: {
-          region,
-          statusCode: statusCode ?? -1,
-          cronTimestamp,
-          latency,
-        },
-      });
-      break;
-    case "degraded":
-      await checkerAudit.publishAuditLog({
-        id: `monitor:${monitorId}`,
-        action: "monitor.degraded",
-        targets: [{ id: monitorId, type: "monitor" }],
-        metadata: {
-          region,
-          statusCode: statusCode ?? -1,
-          cronTimestamp,
-          latency,
-        },
-      });
-      break;
-    case "error":
-      await checkerAudit.publishAuditLog({
-        id: `monitor:${monitorId}`,
-        action: "monitor.failed",
-        targets: [{ id: monitorId, type: "monitor" }],
-        metadata: {
-          region,
-          statusCode: statusCode ?? -1,
-          message,
-          cronTimestamp,
-          latency,
-        },
-      });
-      break;
-  }
-
-  let triggeredNotifications: { notificationId: number; provider: string }[] =
-    [];
-
-  if (affectedRegionCount >= numberOfRegions / 2 || numberOfRegions === 1) {
-    switch (status) {
-      case "active": {
-        if (monitor.status === "active") {
-          break;
-        }
-
-        logger.info("Monitor status changed to active", {
-          monitor_id: monitor.id,
-          workspace_id: monitor.workspaceId,
-        });
-        await db
-          .update(schema.monitor)
-          .set({ status: "active" })
-          .where(eq(schema.monitor.id, monitor.id));
-
-        let incident = null;
-        if (monitor.status === "error") {
-          const incidents = await resolveIncident({ monitorId, cronTimestamp });
-          incident = incidents[0] ?? null;
-        }
-
-        triggeredNotifications = await triggerNotifications({
-          monitorId,
-          statusCode,
-          message,
-          notifType: "recovery",
-          cronTimestamp,
-          regions: affectedRegionsList,
-          latency,
-          incidentId: incident?.id,
-        });
-
-        break;
+  try {
+    const outcome = await db.transaction(async (tx) => {
+      const currentMonitor = await tx
+        .select()
+        .from(schema.monitor)
+        .where(eq(schema.monitor.id, Number(monitorId)))
+        .get();
+      const monitor = selectMonitorSchema.parse(currentMonitor);
+      const priorRow = await tx
+        .select()
+        .from(schema.monitorStatusTable)
+        .where(
+          and(
+            eq(schema.monitorStatusTable.monitorId, monitor.id),
+            eq(schema.monitorStatusTable.region, region),
+          ),
+        )
+        .get();
+      if (
+        priorRow?.cronTimestamp != null &&
+        (cronTimestamp < priorRow.cronTimestamp ||
+          (cronTimestamp === priorRow.cronTimestamp &&
+            status !== priorRow.status))
+      ) {
+        return;
       }
-      case "degraded":
-        if (monitor.status === "degraded") {
-          break;
-        }
 
-        logger.info("Monitor status changed to degraded", {
-          monitor_id: monitor.id,
-          workspace_id: monitor.workspaceId,
+      await tx
+        .insert(schema.monitorStatusTable)
+        .values({ status, region, monitorId: monitor.id, cronTimestamp })
+        .onConflictDoUpdate({
+          target: [
+            schema.monitorStatusTable.monitorId,
+            schema.monitorStatusTable.region,
+          ],
+          set: { status, cronTimestamp, updatedAt: new Date() },
+          setWhere: sql`${schema.monitorStatusTable.cronTimestamp} IS NULL OR excluded.cron_timestamp > ${schema.monitorStatusTable.cronTimestamp}`,
         });
 
-        await db
-          .update(schema.monitor)
-          .set({ status: "degraded" })
-          .where(eq(schema.monitor.id, monitor.id));
+      const affectedRegions = await tx
+        .select({ region: schema.monitorStatusTable.region })
+        .from(schema.monitorStatusTable)
+        .where(
+          and(
+            eq(schema.monitorStatusTable.monitorId, monitor.id),
+            eq(schema.monitorStatusTable.status, status),
+            inArray(schema.monitorStatusTable.region, monitor.regions),
+          ),
+        )
+        .all();
+      if (affectedRegions.length === 0) return;
 
-        let incident = null;
-        if (monitor.status === "error") {
-          const incidents = await resolveIncident({
-            monitorId,
-            cronTimestamp,
-          });
-          incident = incidents[0] ?? null;
-        }
+      const statusChanged = status !== (priorRow?.status ?? "active");
+      const transition =
+        affectedRegions.length >= monitor.regions.length / 2 &&
+        (statusChanged || monitor.status === status)
+          ? await applyMonitorStatus({ tx, monitor, status, cronTimestamp })
+          : undefined;
+      const notification = {
+        monitorId,
+        statusCode,
+        message,
+        notifType:
+          status === "error"
+            ? "alert"
+            : status === "active"
+              ? "recovery"
+              : "degraded",
+        cronTimestamp,
+        regions: affectedRegions.map((entry) => entry.region),
+        latency,
+        incidentId: transition?.incidentId,
+      } satisfies Parameters<typeof enqueueNotifications>[0];
+      if (transition?.changed) {
+        await enqueueNotifications(notification, tx);
+      }
+      return { transition, affectedRegionCount: affectedRegions.length };
+    });
 
-        triggeredNotifications = await triggerNotifications({
-          monitorId,
-          statusCode,
-          message,
-          notifType: "degraded",
-          cronTimestamp,
-          latency,
-          regions: affectedRegionsList,
-          incidentId: incident?.id,
-        });
+    if (!outcome) return c.json({ success: true }, 200);
 
-        break;
-      case "error":
-        if (monitor.status === "error") {
-          break;
-        }
-
-        logger.info("Monitor status changed to error", {
-          monitor_id: monitor.id,
-          workspace_id: monitor.workspaceId,
-        });
-
-        await db
-          .update(schema.monitor)
-          .set({ status: "error" })
-          .where(eq(schema.monitor.id, monitor.id));
-
-        try {
-          const existingIncident = await findOpenIncident(Number(monitorId));
-          if (existingIncident) {
-            logger.info("Already in incident", {
-              incident_id: existingIncident.id,
-            });
-            break;
-          }
-
-          const [newIncident] = await db
-            .insert(incidentTable)
-            .values({
-              monitorId: Number(monitorId),
-              workspaceId: monitor.workspaceId,
-              startedAt: new Date(cronTimestamp),
-            })
-            .returning();
-
-          if (!newIncident?.id) {
-            break;
-          }
-
-          await checkerAudit.publishAuditLog({
-            id: `monitor:${monitorId}`,
-            action: "incident.created",
-            targets: [{ id: monitorId, type: "monitor" }],
-            metadata: { cronTimestamp, incidentId: newIncident.id },
-          });
-
-          triggeredNotifications = await triggerNotifications({
-            monitorId,
-            statusCode,
-            message,
-            notifType: "alert",
-            cronTimestamp,
-            latency,
-            regions: affectedRegionsList,
-            incidentId: newIncident.id,
-          });
-        } catch (error) {
-          logger.warning("Failed to create incident", { error });
-        }
-
-        break;
-      default:
-        logger.error("should not happen");
-        break;
+    await publishStatusAudit({
+      monitorId,
+      status,
+      region,
+      cronTimestamp,
+      statusCode,
+      message,
+      latency,
+      incidents: outcome.transition?.incidents,
+    });
+    const notifications = await triggerNotifications({
+      monitorId,
+      cronTimestamp,
+    });
+    const event = c.get("event");
+    if (event) {
+      event.status_update = {
+        status,
+        message,
+        region,
+        status_code: statusCode,
+        cron_timestamp: cronTimestamp,
+        latency_ms: latency,
+        affectedRegionsCount: outcome.affectedRegionCount,
+        monitorId: Number(monitorId),
+        notificationTriggered: notifications.length > 0,
+        notifications,
+      };
     }
+    return c.text("Ok", 200);
+  } catch (error) {
+    logger.error("Failed to update monitor status", {
+      monitor_id: monitorId,
+      region,
+      error,
+    });
+    return c.text("Internal Server Error", 500);
   }
-
-  (event.status_update as Record<string, unknown>).notificationTriggered =
-    triggeredNotifications.length > 0;
-  (event.status_update as Record<string, unknown>).notifications =
-    triggeredNotifications;
-
-  return c.text("Ok", 200);
 });

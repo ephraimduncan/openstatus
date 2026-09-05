@@ -3,7 +3,7 @@ import { yieldMany } from "@openstatus/utils";
 import { z } from "zod";
 
 import { type ServiceContext, getReadDb } from "../context";
-import { InternalServiceError } from "../errors";
+import { InternalServiceError, PreconditionFailedError } from "../errors";
 import { getMonitorInWorkspace } from "./internal";
 
 export const StreamMonitorPreviewInput = z.object({
@@ -167,6 +167,12 @@ export async function* streamMonitorPreview(args: {
   ctx: ServiceContext;
   input: StreamMonitorPreviewInput;
 }): AsyncGenerator<CheckResult> {
+  if (z.stringbool().prefault("false").parse(process.env.SELF_HOST)) {
+    throw new PreconditionFailedError(
+      "Monitor previews are unavailable on self-hosted instances",
+    );
+  }
+
   const { ctx } = args;
   const input = StreamMonitorPreviewInput.parse(args.input);
 

@@ -2491,6 +2491,7 @@ export class OSTinybird {
       pipe: "endpoint__http_metrics_latency_1d__v1",
       parameters: z.object({
         monitorId: z.string(),
+        regions: z.array(z.enum(monitorRegions).or(z.string())).optional(),
         fromDate: z.string().optional(),
         toDate: z.string().optional(),
       }),
@@ -2510,6 +2511,7 @@ export class OSTinybird {
       pipe: "endpoint__http_metrics_latency_7d__v1",
       parameters: z.object({
         monitorId: z.string(),
+        regions: z.array(z.enum(monitorRegions).or(z.string())).optional(),
         fromDate: z.string().optional(),
         toDate: z.string().optional(),
       }),
@@ -2529,6 +2531,7 @@ export class OSTinybird {
       pipe: "endpoint__http_metrics_latency_1d_multi__v1",
       parameters: z.object({
         monitorIds: z.string().array().min(1),
+        regions: z.array(z.enum(monitorRegions).or(z.string())).optional(),
         fromDate: z.string().optional(),
         toDate: z.string().optional(),
       }),

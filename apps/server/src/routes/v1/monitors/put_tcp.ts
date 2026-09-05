@@ -110,7 +110,7 @@ export function registerPutTCPMonitor(api: typeof monitorsApi) {
           ? JSON.stringify(otelHeadersEntries)
           : undefined,
         otelEndpoint: openTelemetry?.endpoint,
-        timeout: input.timeout || 45000,
+        timeout: input.timeout,
         updatedAt: new Date(),
       })
       .where(eq(monitor.id, Number(_monitor.id)))

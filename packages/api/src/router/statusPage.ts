@@ -24,10 +24,18 @@ import {
   upsertSelfSignupSubscriber,
   verifySelfSignupSubscriber,
 } from "@openstatus/services/page-subscriber";
+import { sendEmailVerification } from "@openstatus/subscriptions";
 import { TRPCError } from "@trpc/server";
 import { endOfDay, startOfDay, subDays } from "date-fns";
 import { z } from "zod";
 
+import {
+  isEmailDomainAuthorized,
+  isPasswordAuthorized,
+} from "../auth/access-predicates";
+import { resolveClientIp } from "../auth/client-ip";
+import { evaluatePageAccess } from "../auth/page-access";
+import { createProtectedCookieKey } from "../auth/protected";
 import { createTRPCRouter, publicProcedure } from "../trpc";
 import {
   type StatusData,
@@ -57,26 +65,6 @@ import {
 
 // NOTE: this router is used on status pages only - do not confuse with the page router which is used in the dashboard for the config
 
-// Length-independent comparison so a wrong guess can't be timed by length or
-// character. Pure JS (no node:crypto) keeps it usable from the Edge runtime.
-function constantTimeEqual(
-  a: string | null | undefined,
-  b: string | null | undefined,
-): boolean {
-  if (a == null || b == null) return false;
-  // constant-time: iterate over the max length and fold the length delta into
-  // the accumulator so we never early-return or branch on length.
-  const max = Math.max(a.length, b.length);
-  let mismatch = a.length ^ b.length;
-  for (let i = 0; i < max; i++) {
-    // out-of-range indices read as 0; mismatch already non-zero on length diff.
-    mismatch |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  }
-  return mismatch === 0;
-}
-
-// Gate fields for getGate, reusing selectPageSchema's stringToArray transforms
-// so authEmailDomains / allowedIpRanges come back as arrays like getLight.
 const gateFieldsSchema = selectPageSchema.pick({
   slug: true,
   customDomain: true,
@@ -85,10 +73,63 @@ const gateFieldsSchema = selectPageSchema.pick({
   allowedIpRanges: true,
   homepageUrl: true,
   contactUrl: true,
+  title: true,
+  description: true,
+  icon: true,
+  allowIndex: true,
+  forceTheme: true,
+  configuration: true,
+  customTheme: true,
+  locales: true,
+  defaultLocale: true,
 });
 
+const accessFieldsSchema = selectPageSchema.pick({
+  accessType: true,
+  password: true,
+  authEmailDomains: true,
+  allowedIpRanges: true,
+  slug: true,
+});
+
+const pageProcedure = publicProcedure
+  .input(z.object({ slug: z.string().toLowerCase() }))
+  .use(async ({ ctx, input, next }) => {
+    if (!input.slug) return next();
+    const row = await ctx.db.query.page.findFirst({
+      where: sql`lower(${page.slug}) = ${input.slug} OR lower(${page.customDomain}) = ${input.slug}`,
+      columns: {
+        slug: true,
+        accessType: true,
+        password: true,
+        authEmailDomains: true,
+        allowedIpRanges: true,
+      },
+    });
+    if (!row) return next();
+    const gate = accessFieldsSchema.parse(row);
+    const access = evaluatePageAccess({
+      ...gate,
+      passwordAuthorized: isPasswordAuthorized({
+        stored: gate.password,
+        queryPassword: ctx.req?.nextUrl.searchParams.get("pw"),
+        cookiePassword: ctx.req?.cookies.get(
+          createProtectedCookieKey(gate.slug),
+        )?.value,
+      }),
+      authEmail: ctx.session?.user?.email,
+      clientIp: ctx.req ? resolveClientIp(ctx.req.headers) : null,
+    });
+    if (!access.ok) {
+      throw new TRPCError({
+        code: access.status === 401 ? "UNAUTHORIZED" : "FORBIDDEN",
+      });
+    }
+    return next();
+  });
+
 export const statusPageRouter = createTRPCRouter({
-  get: publicProcedure
+  get: pageProcedure
     .input(
       z.object({
         slug: z.string().toLowerCase(),
@@ -524,7 +565,7 @@ export const statusPageRouter = createTRPCRouter({
       });
     }),
 
-  getLight: publicProcedure
+  getLight: pageProcedure
     .input(z.object({ slug: z.string().toLowerCase() }))
     .query(async (opts) => {
       if (!opts.input.slug) return null;
@@ -615,9 +656,6 @@ export const statusPageRouter = createTRPCRouter({
       });
     }),
 
-  // Narrow access-check query for the markdown detail routes: returns only the
-  // gate + chrome fields, skipping the full reports/maintenances/components graph
-  // that getLight loads.
   getGate: publicProcedure
     .input(z.object({ slug: z.string().toLowerCase() }))
     .query(async (opts) => {
@@ -633,6 +671,15 @@ export const statusPageRouter = createTRPCRouter({
           allowedIpRanges: true,
           homepageUrl: true,
           contactUrl: true,
+          title: true,
+          description: true,
+          icon: true,
+          allowIndex: true,
+          forceTheme: true,
+          configuration: true,
+          customTheme: true,
+          locales: true,
+          defaultLocale: true,
         },
         with: { workspace: true },
       });
@@ -644,10 +691,14 @@ export const statusPageRouter = createTRPCRouter({
 
       const { workspace: _workspace, ...rest } = _page;
       const gate = gateFieldsSchema.parse(rest);
-      return { ...gate, whiteLabel };
+      return {
+        ...gate,
+        customTheme: ws.data?.limits["custom-theme"] ? gate.customTheme : null,
+        whiteLabel,
+      };
     }),
 
-  getMaintenance: publicProcedure
+  getMaintenance: pageProcedure
     .input(z.object({ slug: z.string().toLowerCase(), id: z.number() }))
     .query(async (opts) => {
       if (!opts.input.slug) return null;
@@ -680,7 +731,7 @@ export const statusPageRouter = createTRPCRouter({
       return selectMaintenancePageSchema.parse(props);
     }),
 
-  getUptime: publicProcedure
+  getUptime: pageProcedure
     .input(
       z.object({
         slug: z.string().toLowerCase(),
@@ -912,7 +963,7 @@ export const statusPageRouter = createTRPCRouter({
     };
   }),
 
-  getReport: publicProcedure
+  getReport: pageProcedure
     .input(z.object({ slug: z.string().toLowerCase(), id: z.number() }))
     .query(async (opts) => {
       if (!opts.input.slug) return null;
@@ -1031,7 +1082,7 @@ export const statusPageRouter = createTRPCRouter({
     return selectStatusReportPageSchema.parse(props);
   }),
 
-  getMonitors: publicProcedure
+  getMonitors: pageProcedure
     .input(z.object({ slug: z.string().toLowerCase() }))
     .query(async (opts) => {
       if (!opts.input.slug) return null;
@@ -1165,7 +1216,7 @@ export const statusPageRouter = createTRPCRouter({
       });
     }),
 
-  getMonitor: publicProcedure
+  getMonitor: pageProcedure
     .input(z.object({ slug: z.string().toLowerCase(), id: z.number() }))
     .query(async (opts) => {
       if (!opts.input.slug) return null;
@@ -1350,7 +1401,23 @@ export const statusPageRouter = createTRPCRouter({
         });
       }
 
-      return { id: subscription.id, token: subscription.token };
+      if (!subscription.token) {
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+      }
+      const verifyUrl = subscription.customDomain
+        ? `https://${subscription.customDomain}/verify/${subscription.token}`
+        : `https://${subscription.pageSlug}.openstatus.dev/verify/${subscription.token}`;
+      await sendEmailVerification(
+        {
+          ...subscription,
+          token: subscription.token,
+          acceptedAt: undefined,
+          unsubscribedAt: undefined,
+        },
+        verifyUrl,
+      );
+
+      return { id: subscription.id };
     }),
 
   getSubscriptionByToken: publicProcedure
@@ -1434,7 +1501,7 @@ export const statusPageRouter = createTRPCRouter({
 
       const allowedDomains = _page.authEmailDomains?.split(",") ?? [];
 
-      if (!allowedDomains.includes(opts.input.email.split("@")[1])) {
+      if (!isEmailDomainAuthorized(opts.input.email, allowedDomains)) {
         throw new TRPCError({
           code: "BAD_REQUEST",
           message: "Invalid email domain",
@@ -1444,7 +1511,7 @@ export const statusPageRouter = createTRPCRouter({
       return {
         email: opts.input.email,
         slug: opts.input.slug,
-        page: _page,
+        page: { title: _page.title },
       };
     }),
 
@@ -1499,7 +1566,13 @@ export const statusPageRouter = createTRPCRouter({
         });
       }
 
-      if (!constantTimeEqual(_page.password, opts.input.password)) {
+      if (
+        !isPasswordAuthorized({
+          stored: _page.password,
+          queryPassword: opts.input.password,
+          cookiePassword: undefined,
+        })
+      ) {
         throw new TRPCError({
           code: "BAD_REQUEST",
           message: "Invalid password",
@@ -1507,29 +1580,6 @@ export const statusPageRouter = createTRPCRouter({
       }
 
       return true;
-    }),
-
-  // Server-side password gate for the public `/api/*` routes. Returns a boolean
-  // so the stored password never leaves the server (the `get` output omits it).
-  isPasswordAuthorized: publicProcedure
-    .input(
-      z.object({
-        slug: z.string().toLowerCase(),
-        queryPassword: z.string().nullish(),
-        cookiePassword: z.string().nullish(),
-      }),
-    )
-    .query(async (opts) => {
-      const _page = await opts.ctx.db.query.page.findFirst({
-        where: sql`lower(${page.slug}) = ${opts.input.slug} OR lower(${page.customDomain}) = ${opts.input.slug}`,
-        columns: { password: true, accessType: true },
-      });
-      if (!_page || _page.accessType !== "password") return false;
-      // TODO: rate-limit — an unauthenticated caller can brute-force guesses here.
-      // Query param wins over cookie: a present-but-wrong `?pw=` must not fall
-      // through to a valid cookie. Mirrors isPasswordAuthorized on the proxy.
-      const submitted = opts.input.queryPassword ?? opts.input.cookiePassword;
-      return constantTimeEqual(_page.password, submitted);
     }),
 
   getSubscriberByToken: publicProcedure

@@ -1,3 +1,11 @@
+import { db, eq } from "@openstatus/db";
+import { page, pageComponent } from "@openstatus/db/src/schema";
+import {
+  createMonitor,
+  createPage,
+  createPageComponent,
+  createTestWorkspace,
+} from "@openstatus/db/src/test/factories";
 import { expect } from "@std/expect";
 import { test } from "@std/testing/bdd";
 
@@ -91,4 +99,116 @@ test("no auth key should return 401", async () => {
     }),
   });
   expect(res.status).toBe(401);
+});
+
+for (const accessType of ["password", "email-domain"] as const) {
+  test(`title-only update preserves ${accessType} settings and components`, async () => {
+    const { workspace } = await createTestWorkspace();
+    const monitor = await createMonitor(workspace.id);
+    const original = await createPage(workspace.id, {
+      customDomain: "status.example.com",
+      accessType,
+      password: "page-password",
+      passwordProtected: accessType === "password",
+      authEmailDomains: "example.com",
+      showMonitorValues: false,
+    });
+    const component = await createPageComponent(workspace.id, original.id, {
+      type: "monitor",
+      monitorId: monitor.id,
+      order: 7,
+    });
+    const staticComponent = await createPageComponent(
+      workspace.id,
+      original.id,
+    );
+    const request = (body: Record<string, unknown>) =>
+      app.request(`/v1/page/${original.id}`, {
+        method: "PUT",
+        headers: {
+          "x-openstatus-key": String(workspace.id),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+    const renamed = await request({ title: "Renamed page" });
+    expect(renamed.status).toBe(200);
+    expect(await renamed.json()).toMatchObject({
+      title: "Renamed page",
+      customDomain: "status.example.com",
+      accessType,
+      monitors: [monitor.id],
+    });
+    expect(
+      await db.query.page.findFirst({ where: eq(page.id, original.id) }),
+    ).toMatchObject({
+      title: "Renamed page",
+      customDomain: "status.example.com",
+      accessType,
+      password: "page-password",
+      passwordProtected: accessType === "password",
+      authEmailDomains: "example.com",
+      showMonitorValues: false,
+    });
+    expect(
+      await db
+        .select()
+        .from(pageComponent)
+        .where(eq(pageComponent.pageId, original.id))
+        .orderBy(pageComponent.id),
+    ).toEqual([component, staticComponent]);
+
+    const cleared = await request({ monitors: [] });
+    expect(cleared.status).toBe(200);
+    expect((await cleared.json()).monitors).toEqual([]);
+    expect(
+      await db
+        .select()
+        .from(pageComponent)
+        .where(eq(pageComponent.pageId, original.id)),
+    ).toEqual([staticComponent]);
+
+    const opened = await request({ accessType: "public" });
+    expect(opened.status).toBe(200);
+    expect(await opened.json()).toMatchObject({
+      accessType: "public",
+      passwordProtected: false,
+    });
+    const fetched = await app.request(`/v1/page/${original.id}`, {
+      headers: { "x-openstatus-key": String(workspace.id) },
+    });
+    expect(fetched.status).toBe(200);
+    expect(await fetched.json()).toMatchObject({
+      accessType: "public",
+      passwordProtected: false,
+    });
+  });
+}
+
+test("explicit domain and legacy password updates still apply", async () => {
+  const { workspace } = await createTestWorkspace();
+  const original = await createPage(workspace.id, {
+    customDomain: "status.example.com",
+  });
+  for (const body of [
+    { customDomain: "", passwordProtected: true, password: "page-password" },
+    { customDomain: null, passwordProtected: false },
+  ]) {
+    const res = await app.request(`/v1/page/${original.id}`, {
+      method: "PUT",
+      headers: {
+        "x-openstatus-key": String(workspace.id),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(200);
+    expect(
+      await db.query.page.findFirst({ where: eq(page.id, original.id) }),
+    ).toMatchObject({
+      customDomain: "",
+      accessType: body.passwordProtected ? "password" : "public",
+    });
+  }
 });

@@ -1,6 +1,9 @@
-import { and, db as defaultDb, eq, inArray } from "@openstatus/db";
+import { and, db as defaultDb, eq, inArray, isNull } from "@openstatus/db";
 import {
   type MonitorStatus,
+  privateLocation,
+  privateLocationMonitorStatus,
+  privateLocationToMonitors,
   selectMonitorSchema,
 } from "@openstatus/db/src/schema";
 import { monitorStatusTable } from "@openstatus/db/src/schema/monitor_status/monitor_status";
@@ -34,12 +37,11 @@ export async function getMonitorStatus(args: {
   });
   const parsed = selectMonitorSchema.parse(record);
 
-  if (parsed.regions.length === 0) {
-    return { id: record.id, regions: [] };
-  }
-
   const rows = await db
-    .select()
+    .select({
+      region: monitorStatusTable.region,
+      status: monitorStatusTable.status,
+    })
     .from(monitorStatusTable)
     .where(
       and(
@@ -49,8 +51,46 @@ export async function getMonitorStatus(args: {
     )
     .all();
 
+  const privateRows = await db
+    .selectDistinct({
+      privateLocationId: privateLocationMonitorStatus.privateLocationId,
+      status: privateLocationMonitorStatus.status,
+    })
+    .from(privateLocationMonitorStatus)
+    .innerJoin(
+      privateLocationToMonitors,
+      and(
+        eq(
+          privateLocationMonitorStatus.monitorId,
+          privateLocationToMonitors.monitorId,
+        ),
+        eq(
+          privateLocationMonitorStatus.privateLocationId,
+          privateLocationToMonitors.privateLocationId,
+        ),
+      ),
+    )
+    .innerJoin(
+      privateLocation,
+      eq(privateLocationMonitorStatus.privateLocationId, privateLocation.id),
+    )
+    .where(
+      and(
+        eq(privateLocationMonitorStatus.monitorId, record.id),
+        eq(privateLocation.workspaceId, ctx.workspace.id),
+        isNull(privateLocationToMonitors.deletedAt),
+      ),
+    )
+    .all();
+
   return {
     id: record.id,
-    regions: rows.map((r) => ({ region: r.region, status: r.status })),
+    regions: [
+      ...rows,
+      ...privateRows.map((r) => ({
+        region: String(r.privateLocationId),
+        status: r.status,
+      })),
+    ],
   };
 }

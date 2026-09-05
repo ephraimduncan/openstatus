@@ -1,16 +1,19 @@
-import { selectNotificationSchema } from "@openstatus/db/src/schema";
+import {
+  type Monitor,
+  selectNotificationSchema,
+} from "@openstatus/db/src/schema";
 import { expect } from "@std/expect";
 import { afterEach, beforeEach, describe, test } from "@std/testing/bdd";
 import { assertSpyCalls, stub, type Stub } from "@std/testing/mock";
 
-import { sendAlert, sendDegraded, sendTest } from "./index";
+import { sendAlert, sendDegraded, sendRecovery, sendTest } from "./index";
 
 describe("OpsGenie Notifications", () => {
   let fetchMock: Stub<typeof globalThis>;
 
   beforeEach(() => {
     fetchMock = stub(globalThis, "fetch", () =>
-      Promise.resolve(new Response(null, { status: 200 })),
+      Promise.resolve(new Response(null, { status: 202 })),
     );
   });
 
@@ -18,16 +21,34 @@ describe("OpsGenie Notifications", () => {
     fetchMock.restore();
   });
 
-  const createMockMonitor = () => ({
-    id: "monitor-1",
+  const createMockMonitor = (): Monitor => ({
+    id: 1,
     name: "API Health Check",
     url: "https://api.example.com/health",
-    jobType: "http" as const,
-    periodicity: "5m" as const,
-    status: "active" as const,
+    jobType: "http",
+    periodicity: "5m",
+    status: "active",
     createdAt: new Date(),
     updatedAt: new Date(),
-    region: "us-east-1",
+    active: true,
+    public: true,
+    regions: ["iad"],
+    description: "",
+    headers: [],
+    body: "",
+    workspaceId: 1,
+    timeout: 45000,
+    degradedAfter: null,
+    assertions: null,
+    method: "GET",
+    deletedAt: null,
+    externalName: null,
+    otelEndpoint: null,
+    otelHeaders: [],
+    retry: 3,
+    followRedirects: false,
+    grpcService: null,
+    grpcTls: null,
   });
 
   const createMockNotification = (region: "eu" | "us" = "us") => ({
@@ -45,31 +66,17 @@ describe("OpsGenie Notifications", () => {
     }),
   });
 
-  const createMockIncident = () => ({
-    id: 1,
-    title: "API Health Check is down",
-    summary: "API Health Check is down",
-    status: "triage" as const,
-    monitorId: "monitor-1",
-    workspaceId: 1,
-    startedAt: Date.now(),
-  });
-
   test("Send Alert with US region", async () => {
     const monitor = createMockMonitor();
     const notification = selectNotificationSchema.parse(
       createMockNotification("us"),
     );
-    const incident = createMockIncident();
 
     await sendAlert({
-      // @ts-expect-error
       monitor,
       notification,
       statusCode: 500,
       message: "Something went wrong",
-      // @ts-expect-error
-      incident,
       cronTimestamp: Date.now(),
     });
 
@@ -82,7 +89,7 @@ describe("OpsGenie Notifications", () => {
 
     const body = JSON.parse(callArgs[1].body);
     expect(body.message).toBe("API Health Check is down");
-    expect(body.alias).toBe("monitor-1");
+    expect(body.alias).toBe("1");
     expect(body.details.severity).toBe("down");
     expect(body.details.status).toBe(500);
     expect(body.details.message).toBe("Something went wrong");
@@ -93,15 +100,11 @@ describe("OpsGenie Notifications", () => {
     const notification = selectNotificationSchema.parse(
       createMockNotification("eu"),
     );
-    const incident = createMockIncident();
     await sendAlert({
-      // @ts-expect-error
       monitor,
       notification,
       statusCode: 500,
       message: "Error",
-      // @ts-expect-error
-      incident,
       cronTimestamp: Date.now(),
     });
 
@@ -115,15 +118,11 @@ describe("OpsGenie Notifications", () => {
     const notification = selectNotificationSchema.parse(
       createMockNotification(),
     );
-    const incident = createMockIncident();
     await sendDegraded({
-      // @ts-expect-error
       monitor,
       notification,
       statusCode: 503,
       message: "Service degraded",
-      // @ts-expect-error
-      incident,
       cronTimestamp: Date.now(),
     });
 
@@ -134,32 +133,77 @@ describe("OpsGenie Notifications", () => {
     expect(body.message).toBe("API Health Check is degraded");
   });
 
-  test("Handle fetch error gracefully", async () => {
-    fetchMock.restore();
-    fetchMock = stub(globalThis, "fetch", () =>
-      Promise.reject(new Error("Network error")),
-    );
+  for (const [region, origin] of [
+    ["us", "https://api.opsgenie.com"],
+    ["eu", "https://api.eu.opsgenie.com"],
+  ] as const) {
+    test(`sendRecovery closes the monitor alias in ${region}`, async () => {
+      await sendRecovery({
+        monitor: createMockMonitor(),
+        notification: selectNotificationSchema.parse(
+          createMockNotification(region),
+        ),
+        cronTimestamp: 1_780_000_000_000,
+      });
 
-    const monitor = createMockMonitor();
-    const notification = selectNotificationSchema.parse(
-      createMockNotification(),
-    );
-    const incident = createMockIncident();
-    expect(
-      sendAlert({
-        // @ts-expect-error
-        monitor,
-        notification,
-        statusCode: 500,
-        message: "Error",
-        // @ts-expect-error
-        incident,
-        cronTimestamp: Date.now(),
-      }),
-    ).rejects.toThrow();
+      assertSpyCalls(fetchMock, 1);
+      const [url, init] = fetchMock.calls[0].args;
+      const request = new Request(url, init);
+      expect(request.url).toBe(
+        `${origin}/v2/alerts/1/close?identifierType=alias`,
+      );
+      expect(request.method).toBe("POST");
+      expect(request.headers.get("Authorization")).toBe(
+        "GenieKey test-api-key-123",
+      );
+      expect(await request.json()).toEqual({ source: "OpenStatus" });
+    });
+  }
 
-    assertSpyCalls(fetchMock, 1);
-  });
+  for (const [name, send] of [
+    ["sendAlert", sendAlert],
+    ["sendRecovery", sendRecovery],
+    ["sendDegraded", sendDegraded],
+  ] as const) {
+    test(`${name} rejects an HTTP failure instead of acknowledging delivery`, async () => {
+      fetchMock.restore();
+      fetchMock = stub(globalThis, "fetch", () =>
+        Promise.resolve(new Response(null, { status: 503 })),
+      );
+
+      await expect(
+        send({
+          monitor: createMockMonitor(),
+          notification: selectNotificationSchema.parse(
+            createMockNotification(),
+          ),
+          message: "Service status changed",
+          cronTimestamp: 1_780_000_000_000,
+        }),
+      ).rejects.toThrow();
+
+      assertSpyCalls(fetchMock, 1);
+    });
+
+    test(`${name} propagates a network failure instead of acknowledging delivery`, async () => {
+      const error = new Error("Network error");
+      fetchMock.restore();
+      fetchMock = stub(globalThis, "fetch", () => Promise.reject(error));
+
+      await expect(
+        send({
+          monitor: createMockMonitor(),
+          notification: selectNotificationSchema.parse(
+            createMockNotification(),
+          ),
+          message: "Service status changed",
+          cronTimestamp: 1_780_000_000_000,
+        }),
+      ).rejects.toBe(error);
+
+      assertSpyCalls(fetchMock, 1);
+    });
+  }
 
   test("Send Test returns false on error", async () => {
     fetchMock.restore();

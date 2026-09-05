@@ -12,7 +12,7 @@ export default function RestrictedPage() {
   const t = useExtracted();
   const trpc = useTRPC();
   const { data: page } = useQuery(
-    trpc.statusPage.get.queryOptions({ slug: domain }),
+    trpc.statusPage.getGate.queryOptions({ slug: domain }),
   );
 
   if (page && page.accessType !== "ip-restriction") {

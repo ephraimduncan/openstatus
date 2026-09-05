@@ -39,6 +39,7 @@ import {
 
 import { env } from "../../../../env";
 import {
+  assertHostedCheckerAvailable,
   getCheckerPayload,
   getCheckerTimeout,
   getCheckerUrl,
@@ -649,6 +650,7 @@ export const monitorServiceImpl: ServiceImpl<typeof MonitorService> = {
   async triggerMonitor(req, ctx) {
     const rpcCtx = getRpcContext(ctx);
     const limits = rpcCtx.workspace.limits;
+    assertHostedCheckerAvailable();
 
     // The run is recorded first so a caller without write scope — or one
     // over its quota — is rejected before any probe leaves the network.

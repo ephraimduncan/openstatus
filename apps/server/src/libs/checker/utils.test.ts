@@ -1,12 +1,22 @@
 import type { z } from "@hono/zod-openapi";
 import type { selectMonitorSchema } from "@openstatus/db/src/schema";
-import { expect, test } from "@openstatus/test-utils";
+import { afterEach, beforeEach, expect, test } from "@openstatus/test-utils";
 
 import { OpenStatusApiError } from "@/libs/errors";
 
 import { getCheckerPayload, getCheckerUrl } from "./utils";
 
 type Monitor = z.infer<typeof selectMonitorSchema>;
+const originalSelfHost = process.env.SELF_HOST;
+
+beforeEach(() => {
+  process.env.SELF_HOST = "false";
+});
+
+afterEach(() => {
+  if (originalSelfHost === undefined) delete process.env.SELF_HOST;
+  else process.env.SELF_HOST = originalSelfHost;
+});
 
 function buildMonitor(overrides: Partial<Monitor> = {}): Monitor {
   return {
@@ -43,6 +53,16 @@ test("getCheckerUrl routes each job type to its own checker endpoint", () => {
     const url = getCheckerUrl(buildMonitor({ jobType }));
     expect(url).toContain(`/checker/${jobType}?`);
     expect(url).toContain("monitor_id=1");
+  }
+});
+
+test("self-hosted manual runs cannot resolve a hosted checker endpoint", () => {
+  process.env.SELF_HOST = "true";
+
+  for (const jobType of ["http", "tcp", "dns", "icmp", "grpc"] as const) {
+    expect(() => getCheckerUrl(buildMonitor({ jobType }))).toThrow(
+      OpenStatusApiError,
+    );
   }
 });
 

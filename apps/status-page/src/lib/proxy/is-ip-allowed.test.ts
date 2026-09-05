@@ -1,7 +1,6 @@
+import { isIpAllowed } from "@openstatus/api/src/auth/is-ip-allowed";
 import { expect } from "@std/expect";
 import { describe, test } from "@std/testing/bdd";
-
-import { isIpAllowed } from "./is-ip-allowed";
 
 describe("isIpAllowed", () => {
   test("empty allowed ranges → denies all", () => {

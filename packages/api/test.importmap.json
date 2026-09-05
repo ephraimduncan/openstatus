@@ -1,5 +1,6 @@
 {
   "imports": {
-    "@openstatus/upstash": "./src/test/upstash.mock.ts"
+    "@openstatus/upstash": "./src/test/upstash.mock.ts",
+    "next/server": "./node_modules/next/server.js"
   }
 }

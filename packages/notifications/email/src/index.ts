@@ -1,8 +1,7 @@
 import { emailDataSchema } from "@openstatus/db/src/schema";
-import type { Region } from "@openstatus/db/src/schema/constants";
 import { EmailClient } from "@openstatus/emails/src/client";
 import type { NotificationContext } from "@openstatus/notification-base";
-import { regionDict } from "@openstatus/regions";
+import { getRegionInfo } from "@openstatus/regions";
 
 import { env } from "../env";
 
@@ -15,22 +14,21 @@ export const sendAlert = async ({
   latency,
   regions,
 }: NotificationContext) => {
-  // Convert regions array to single region for backwards compatibility
-  const region = regions?.[0] as Region | undefined;
+  const region = regions?.[0];
   const emailClient = new EmailClient({ apiKey: env.RESEND_API_KEY });
 
-  const config = emailDataSchema.safeParse(JSON.parse(notification.data));
-
-  if (!config.success) return;
+  const config = emailDataSchema.parse(JSON.parse(notification.data));
 
   await emailClient.sendMonitorAlert({
     name: monitor.name,
     type: "alert",
-    to: config.data.email,
+    to: config.email,
     url: monitor.url,
     status: statusCode?.toString(),
     latency: latency ? `${latency}ms` : "N/A",
-    region: region ? regionDict[region].location : "N/A",
+    region: region
+      ? (getRegionInfo(region, { location: region }).location ?? region)
+      : "N/A",
     timestamp: new Date(cronTimestamp).toISOString(),
     message,
   });
@@ -44,22 +42,21 @@ export const sendRecovery = async ({
   regions,
   latency,
 }: NotificationContext) => {
-  // Convert regions array to single region for backwards compatibility
-  const region = regions?.[0] as Region | undefined;
+  const region = regions?.[0];
   const emailClient = new EmailClient({ apiKey: env.RESEND_API_KEY });
 
-  const config = emailDataSchema.safeParse(JSON.parse(notification.data));
-
-  if (!config.success) return;
+  const config = emailDataSchema.parse(JSON.parse(notification.data));
 
   await emailClient.sendMonitorAlert({
     name: monitor.name,
     type: "recovery",
-    to: config.data.email,
+    to: config.email,
     url: monitor.url,
     status: statusCode?.toString(),
     latency: latency ? `${latency}ms` : "N/A",
-    region: region ? regionDict[region].location : "N/A",
+    region: region
+      ? (getRegionInfo(region, { location: region }).location ?? region)
+      : "N/A",
     timestamp: new Date(cronTimestamp).toISOString(),
   });
 };
@@ -72,22 +69,21 @@ export const sendDegraded = async ({
   regions,
   latency,
 }: NotificationContext) => {
-  // Convert regions array to single region for backwards compatibility
-  const region = regions?.[0] as Region | undefined;
+  const region = regions?.[0];
   const emailClient = new EmailClient({ apiKey: env.RESEND_API_KEY });
 
-  const config = emailDataSchema.safeParse(JSON.parse(notification.data));
-
-  if (!config.success) return;
+  const config = emailDataSchema.parse(JSON.parse(notification.data));
 
   await emailClient.sendMonitorAlert({
     name: monitor.name,
     type: "degraded",
-    to: config.data.email,
+    to: config.email,
     url: monitor.url,
     status: statusCode?.toString(),
     latency: latency ? `${latency}ms` : "N/A",
-    region: region ? regionDict[region].location : "N/A",
+    region: region
+      ? (getRegionInfo(region, { location: region }).location ?? region)
+      : "N/A",
     timestamp: new Date(cronTimestamp).toISOString(),
   });
 };

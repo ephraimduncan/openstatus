@@ -1,302 +1,279 @@
 import { getLogger } from "@logtape/logtape";
-import { and, count, db, eq, gte, inArray, schema } from "@openstatus/db";
-import type { Incident, MonitorStatus } from "@openstatus/db/src/schema";
+import {
+  and,
+  asc,
+  count,
+  db,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  lte,
+  or,
+  schema,
+} from "@openstatus/db";
 import {
   selectMonitorSchema,
   selectNotificationSchema,
   selectWorkspaceSchema,
 } from "@openstatus/db/src/schema";
-import type { Region } from "@openstatus/db/src/schema/constants";
-import { Effect, Schedule } from "effect";
+import type { DrizzleTx } from "@openstatus/services";
+import { Effect, Either, Schedule } from "effect";
+import { z } from "zod";
 
 import { checkerAudit } from "../utils/audit-log";
 import { providerToFunction } from "./utils";
 
 const logger = getLogger("workflow");
+const leaseDuration = 5 * 60_000;
+const notificationInputSchema = z.object({
+  monitorId: z.string(),
+  statusCode: z.number().optional(),
+  message: z.string().optional(),
+  notifType: z.enum(["alert", "recovery", "degraded"]),
+  cronTimestamp: z.number(),
+  incidentId: z.number().optional(),
+  regions: z.array(z.string()).optional(),
+  latency: z.number().optional(),
+});
+type NotificationInput = z.infer<typeof notificationInputSchema>;
 
-export const triggerNotifications = async ({
-  monitorId,
-  statusCode,
-  message,
-  notifType,
-  cronTimestamp,
-  incidentId,
-  regions,
-  latency,
-}: {
-  monitorId: string;
-  statusCode?: number;
-  message?: string;
-  notifType: "alert" | "recovery" | "degraded";
-  cronTimestamp: number;
-  incidentId?: number;
-  regions?: string[];
-  latency?: number;
-}): Promise<{ notificationId: number; provider: string }[]> => {
-  logger.info("Triggering alerting", {
-    monitor_id: monitorId,
-    notification_type: notifType,
-  });
+/** Persist delivery intent in the same transaction as the monitor transition. */
+export async function enqueueNotifications(
+  input: NotificationInput,
+  tx: DrizzleTx,
+): Promise<void> {
+  const notifications = await tx
+    .select({ notificationId: schema.notificationsToMonitors.notificationId })
+    .from(schema.notificationsToMonitors)
+    .where(
+      eq(schema.notificationsToMonitors.monitorId, Number(input.monitorId)),
+    );
+  if (notifications.length === 0) return;
 
-  const triggered: { notificationId: number; provider: string }[] = [];
+  const payload = JSON.stringify(input);
+  await tx.insert(schema.notificationTrigger).values(
+    notifications.map(({ notificationId }) => ({
+      notificationId,
+      monitorId: Number(input.monitorId),
+      cronTimestamp: input.cronTimestamp,
+      status: "pending" as const,
+      payload,
+    })),
+  );
+}
 
-  let incident: Incident | undefined;
-  if (incidentId) {
-    try {
-      incident = await db.query.incidentTable.findFirst({
-        where: eq(schema.incidentTable.id, incidentId),
-      });
-    } catch (err) {
-      logger.warn("Failed to fetch incident data", {
-        incident_id: incidentId,
-        error_message: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
+/** Deliver pending intent; reject while any delivery still needs a retry. */
+export async function triggerNotifications(
+  input: Pick<NotificationInput, "monitorId" | "cronTimestamp">,
+): Promise<{ notificationId: number; provider: string }[]> {
   const notifications = await db
     .select()
-    .from(schema.notificationsToMonitors)
+    .from(schema.notificationTrigger)
     .innerJoin(
       schema.notification,
-      eq(schema.notification.id, schema.notificationsToMonitors.notificationId),
+      eq(schema.notification.id, schema.notificationTrigger.notificationId),
     )
     .innerJoin(
       schema.monitor,
-      eq(schema.monitor.id, schema.notificationsToMonitors.monitorId),
+      eq(schema.monitor.id, schema.notificationTrigger.monitorId),
     )
-    .where(eq(schema.monitor.id, Number(monitorId)))
-    .all();
+    .where(
+      and(
+        eq(schema.notificationTrigger.monitorId, Number(input.monitorId)),
+        eq(schema.notificationTrigger.status, "pending"),
+        lte(schema.notificationTrigger.cronTimestamp, input.cronTimestamp),
+      ),
+    )
+    .orderBy(
+      asc(schema.notificationTrigger.cronTimestamp),
+      asc(schema.notificationTrigger.id),
+    );
+  const triggered: { notificationId: number; provider: string }[] = [];
+  const failed = new Set<number>();
+
   for (const notif of notifications) {
-    // for sms check we are in the quota
-    if (notif.notification.provider === "sms") {
-      if (notif.notification.workspaceId === null) {
-        continue;
-      }
-
-      const workspace = await db
-        .select()
-        .from(schema.workspace)
-        .where(eq(schema.workspace.id, notif.notification.workspaceId));
-
-      if (workspace.length !== 1) {
-        continue;
-      }
-
-      const data = selectWorkspaceSchema.parse(workspace[0]);
-
-      const oneMonthAgo = new Date();
-      oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-
-      const smsNotification = await db
-        .select()
-        .from(schema.notification)
-        .where(
-          and(
-            eq(schema.notification.workspaceId, notif.notification.workspaceId),
-            eq(schema.notification.provider, "sms"),
-          ),
-        );
-      const ids = smsNotification.map((notification) => notification.id);
-
-      const smsSent = await db
-        .select({ count: count() })
-        .from(schema.notificationTrigger)
-        .where(
-          and(
-            gte(
-              schema.notificationTrigger.cronTimestamp,
-              Math.floor(oneMonthAgo.getTime() / 1000),
-            ),
-            inArray(schema.notificationTrigger.notificationId, ids),
-          ),
-        )
-        .all();
-
-      if ((smsSent[0]?.count ?? 0) > data.limits["sms-limit"]) {
-        logger.warn(
-          `SMS quota exceeded for workspace ${notif.notification.workspaceId}`,
-        );
-        continue;
-      }
-    }
-    logger.info("Sending notification", {
-      monitor_id: monitorId,
-      provider: notif.notification.provider,
-      notification_type: notifType,
-      notification_id: notif.notification.id,
-    });
+    if (failed.has(notif.notification.id)) continue;
+    const payload = notificationInputSchema.parse(
+      JSON.parse(notif.notification_trigger.payload ?? "null"),
+    );
     const monitor = selectMonitorSchema.parse(notif.monitor);
-    try {
-      await insertNotificationTrigger({
-        monitorId: monitor.id,
-        notificationId: notif.notification.id,
-        cronTimestamp: cronTimestamp,
-      });
-    } catch (_e) {
-      logger.error("notification trigger already exists dont send again");
+    const notification = selectNotificationSchema.parse(notif.notification);
+
+    if (notification.provider === "sms" && !(await hasSmsQuota(notification))) {
+      failed.add(notification.id);
       continue;
     }
-    triggered.push({
-      notificationId: notif.notification.id,
-      provider: notif.notification.provider,
-    });
-    switch (notifType) {
-      case "alert":
-        const alertResult = Effect.tryPromise({
-          try: () =>
-            providerToFunction[notif.notification.provider].sendAlert({
-              monitor,
-              notification: selectNotificationSchema.parse(notif.notification),
-              statusCode,
-              message,
-              incident,
-              cronTimestamp,
-              regions,
-              latency,
-            }),
 
-          catch: (_unknown) =>
-            new Error(
-              `Failed sending notification via ${notif.notification.provider} for monitor ${monitorId}`,
-            ),
-        }).pipe(
-          Effect.retry({
-            times: 3,
-            schedule: Schedule.exponential("1000 millis"),
-          }),
-        );
-        await Effect.runPromise(alertResult).catch((err) =>
-          logger.error("Failed to send alert notification", {
-            monitor_id: monitorId,
-            provider: notif.notification.provider,
-            error_message: err instanceof Error ? err.message : String(err),
-          }),
-        );
-        break;
-      case "recovery":
-        const recoveryResult = Effect.tryPromise({
-          try: () =>
-            providerToFunction[notif.notification.provider].sendRecovery({
-              monitor,
-              notification: selectNotificationSchema.parse(notif.notification),
-              statusCode,
-              message,
-              incident,
-              cronTimestamp,
-              regions,
-              latency,
-            }),
-          catch: (_unknown) =>
-            new Error(
-              `Failed sending notification via ${notif.notification.provider} for monitor ${monitorId}`,
-            ),
-        }).pipe(
-          Effect.retry({
-            times: 3,
-            schedule: Schedule.exponential("1000 millis"),
-          }),
-        );
-        await Effect.runPromise(recoveryResult).catch((err) =>
-          logger.error("Failed to send recovery notification", {
-            monitor_id: monitorId,
-            provider: notif.notification.provider,
-            error_message: err instanceof Error ? err.message : String(err),
-          }),
-        );
-        break;
-      case "degraded":
-        const degradedResult = Effect.tryPromise({
-          try: () =>
-            providerToFunction[notif.notification.provider].sendDegraded({
-              monitor,
-              notification: selectNotificationSchema.parse(notif.notification),
-              statusCode,
-              message,
-              incident,
-              cronTimestamp,
-              regions,
-              latency,
-            }),
-          catch: (_unknown) =>
-            new Error(
-              `Failed sending notification via ${notif.notification.provider} for monitor ${monitorId}`,
-            ),
-        }).pipe(
-          Effect.retry({
-            times: 3,
-            schedule: Schedule.exponential("1000 millis"),
-          }),
-        );
-        await Effect.runPromise(degradedResult).catch((err) =>
-          logger.error("Failed to send degraded notification", {
-            monitor_id: monitorId,
-            provider: notif.notification.provider,
-            error_message: err instanceof Error ? err.message : String(err),
-          }),
-        );
-        break;
+    const token = crypto.randomUUID();
+    const [claim] = await db
+      .update(schema.notificationTrigger)
+      .set({ leaseToken: token, leaseExpiresAt: Date.now() + leaseDuration })
+      .where(
+        and(
+          eq(schema.notificationTrigger.id, notif.notification_trigger.id),
+          eq(schema.notificationTrigger.status, "pending"),
+          or(
+            isNull(schema.notificationTrigger.leaseExpiresAt),
+            lte(schema.notificationTrigger.leaseExpiresAt, Date.now()),
+          ),
+        ),
+      )
+      .returning({ id: schema.notificationTrigger.id });
+    if (!claim) {
+      const current = await db
+        .select({ status: schema.notificationTrigger.status })
+        .from(schema.notificationTrigger)
+        .where(eq(schema.notificationTrigger.id, notif.notification_trigger.id))
+        .get();
+      if (current?.status === "pending") failed.add(notification.id);
+      continue;
     }
-    // ALPHA
-    await checkerAudit.publishAuditLog({
-      id: `monitor:${monitorId}`,
-      action: "notification.sent",
-      targets: [{ id: monitorId, type: "monitor" }],
-      metadata: {
-        provider: notif.notification.provider,
-        cronTimestamp,
-        type: notifType,
-        notificationId: notif.notification.id,
-      },
-    });
+
+    const owner = and(
+      eq(schema.notificationTrigger.id, claim.id),
+      eq(schema.notificationTrigger.status, "pending"),
+      eq(schema.notificationTrigger.leaseToken, token),
+    );
+    let leaseLost = false;
+    let delivered = false;
+    let heartbeat = Promise.resolve();
+    const timer = setInterval(() => {
+      heartbeat = heartbeat
+        .then(async () => {
+          const renewed = await db
+            .update(schema.notificationTrigger)
+            .set({ leaseExpiresAt: Date.now() + leaseDuration })
+            .where(owner)
+            .returning({ id: schema.notificationTrigger.id });
+          if (renewed.length === 0) leaseLost = true;
+        })
+        .catch(() => {
+          leaseLost = true;
+        });
+    }, 30_000);
+
+    try {
+      const incident =
+        payload.incidentId === undefined
+          ? undefined
+          : await db.query.incidentTable.findFirst({
+              where: eq(schema.incidentTable.id, payload.incidentId),
+            });
+      const provider = providerToFunction[notification.provider];
+      const send = {
+        alert: provider.sendAlert,
+        recovery: provider.sendRecovery,
+        degraded: provider.sendDegraded,
+      }[payload.notifType];
+      const context = { ...payload, monitor, notification, incident };
+      const result = await Effect.runPromise(
+        Effect.tryPromise({
+          try: () =>
+            leaseLost
+              ? Promise.reject(new Error("Notification lease lost"))
+              : send(context),
+          catch: () =>
+            new Error(
+              `Failed sending notification via ${notification.provider} for monitor ${monitor.id}`,
+            ),
+        }).pipe(
+          Effect.retry({
+            times: 3,
+            schedule: Schedule.exponential("1000 millis"),
+          }),
+          Effect.either,
+        ),
+      );
+      if (Either.isLeft(result) || leaseLost) {
+        logger.error("Failed to send notification", {
+          monitor_id: monitor.id,
+          provider: notification.provider,
+          notification_id: notification.id,
+          notification_type: payload.notifType,
+        });
+        failed.add(notification.id);
+        continue;
+      }
+
+      const [sent] = await db
+        .update(schema.notificationTrigger)
+        .set({ status: "sent", leaseToken: null, leaseExpiresAt: null })
+        .where(owner)
+        .returning({ id: schema.notificationTrigger.id });
+      if (!sent) {
+        failed.add(notification.id);
+        continue;
+      }
+      delivered = true;
+      triggered.push({
+        notificationId: notification.id,
+        provider: notification.provider,
+      });
+      await checkerAudit.publishAuditLog({
+        id: `monitor:${monitor.id}`,
+        action: "notification.sent",
+        targets: [{ id: String(monitor.id), type: "monitor" }],
+        metadata: {
+          provider: notification.provider,
+          cronTimestamp: payload.cronTimestamp,
+          type: payload.notifType,
+          notificationId: notification.id,
+        },
+      });
+    } finally {
+      clearInterval(timer);
+      await heartbeat;
+      if (!delivered) {
+        await db
+          .update(schema.notificationTrigger)
+          .set({ leaseToken: null, leaseExpiresAt: null })
+          .where(owner);
+      }
+    }
   }
 
+  if (failed.size > 0)
+    throw new Error(
+      `Notification delivery pending for monitor ${input.monitorId}`,
+    );
   return triggered;
-};
+}
 
-const insertNotificationTrigger = async ({
-  monitorId,
-  notificationId,
-  cronTimestamp,
-}: {
-  monitorId: number;
-  notificationId: number;
-  cronTimestamp: number;
-}) => {
-  await db
-    .insert(schema.notificationTrigger)
-    .values({
-      monitorId: Number(monitorId),
-      notificationId: notificationId,
-      cronTimestamp: cronTimestamp,
-    })
-    .returning();
-};
-
-export const upsertMonitorStatus = async ({
-  monitorId,
-  status,
-  region,
-}: {
-  monitorId: string;
-  status: MonitorStatus;
-  region: Region;
-}) => {
-  const newData = await db
-    .insert(schema.monitorStatusTable)
-    .values({ status, region, monitorId: Number(monitorId) })
-    .onConflictDoUpdate({
-      target: [
-        schema.monitorStatusTable.monitorId,
-        schema.monitorStatusTable.region,
-      ],
-      set: { status, updatedAt: new Date() },
-    })
-    .returning();
-  logger.debug("Upserted monitor status", {
-    monitor_id: monitorId,
-    region,
-    status,
-    updated_at: newData[0]?.updatedAt,
-  });
-};
+async function hasSmsQuota(
+  notification: z.infer<typeof selectNotificationSchema>,
+): Promise<boolean> {
+  if (notification.workspaceId === null) return false;
+  const workspace = await db
+    .select()
+    .from(schema.workspace)
+    .where(eq(schema.workspace.id, notification.workspaceId))
+    .get();
+  if (!workspace) return false;
+  const data = selectWorkspaceSchema.parse(workspace);
+  const oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+  const smsNotifications = await db
+    .select({ id: schema.notification.id })
+    .from(schema.notification)
+    .where(
+      and(
+        eq(schema.notification.workspaceId, notification.workspaceId),
+        eq(schema.notification.provider, "sms"),
+      ),
+    );
+  const [sent] = await db
+    .select({ count: count() })
+    .from(schema.notificationTrigger)
+    .where(
+      and(
+        eq(schema.notificationTrigger.status, "sent"),
+        gte(schema.notificationTrigger.cronTimestamp, oneMonthAgo.getTime()),
+        inArray(
+          schema.notificationTrigger.notificationId,
+          smsNotifications.map(({ id }) => id),
+        ),
+      ),
+    );
+  return (sent?.count ?? 0) < data.limits["sms-limit"];
+}

@@ -83,7 +83,7 @@ export function registerPutDNSMonitor(api: typeof monitorsApi) {
       });
     }
 
-    if (_monitor.jobType !== "tcp") {
+    if (_monitor.jobType !== "dns") {
       throw new OpenStatusApiError({
         code: "NOT_FOUND",
         message: `Monitor ${id} not found`,
@@ -110,7 +110,7 @@ export function registerPutDNSMonitor(api: typeof monitorsApi) {
           ? JSON.stringify(otelHeadersEntries)
           : undefined,
         otelEndpoint: openTelemetry?.endpoint,
-        timeout: input.timeout || 45000,
+        timeout: input.timeout,
         updatedAt: new Date(),
       })
       .where(eq(monitor.id, Number(_monitor.id)))

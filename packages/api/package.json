@@ -51,6 +51,7 @@
     "@vercel/blob": "catalog:",
     "date-fns": "catalog:",
     "drizzle-orm": "catalog:",
+    "ip-cidr": "catalog:",
     "isomorphic-dompurify": "catalog:",
     "nanoid": "catalog:",
     "nanoid-dictionary": "catalog:",

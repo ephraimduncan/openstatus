@@ -42,6 +42,8 @@ export const cron = async ({
   // oxlint-disable-next-line eslint/no-unused-vars
   req,
 }: z.infer<typeof periodicityAvailable> & { req: NextRequest }) => {
+  if (z.stringbool().prefault("false").parse(process.env.SELF_HOST)) return;
+
   const client = new CloudTasksClient({
     projectId: env.GCP_PROJECT_ID,
     credentials: {

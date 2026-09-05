@@ -54,8 +54,7 @@ func ProtoStringAssertionToComparator(assertion v1.StringComparator) (request.St
 	return "", fmt.Errorf("unknown comparator type: %v", assertion)
 }
 
-// httpFailureMessage explains a failed check in the alert body: checker.Http
-// only fills Error for transport failures such as timeouts.
+// HTTP status and assertion failures need a message even without a probe error.
 func httpFailureMessage(res checker.Response, statusOK bool) string {
 	switch {
 	case res.Error != "":
@@ -129,16 +128,17 @@ func (jr jobRunner) HTTPJob(ctx context.Context, monitor *v1.HTTPMonitor, region
 		req.OtelConfig.Headers = headersToMap(otelCfg.GetHeaders())
 	}
 
-	var called int
 	var lastRes checker.Response
 
 	op := func() (*HttpPrivateRegionData, error) {
-		called++
 		res, err := checker.Http(ctx, requestClient, req)
+		lastRes = res
+		if err := context.Cause(ctx); err != nil {
+			return nil, err
+		}
 		if err != nil {
 			return nil, fmt.Errorf("unable to ping: %w", err)
 		}
-		lastRes = res
 
 		timingBytes, err := json.Marshal(res.Timing)
 		if err != nil {
@@ -154,13 +154,7 @@ func (jr jobRunner) HTTPJob(ctx context.Context, monitor *v1.HTTPMonitor, region
 		}
 
 		status := statusCode(res.Status)
-		// Only use default 2xx check if no status assertions exist
-		// If status assertions are configured, let them determine success
-		hasStatusAssertions := len(monitor.StatusCodeAssertions) > 0
-		isSuccessful := status.IsSuccessful()
-		if hasStatusAssertions {
-			isSuccessful = true // Start with true, assertions will override
-		}
+		isSuccessful := res.Error == "" && (len(monitor.StatusCodeAssertions) > 0 || status.IsSuccessful())
 
 		if len(monitor.HeaderAssertions) > 0 {
 			headersAsString, err := json.Marshal(res.Headers)
@@ -240,12 +234,8 @@ func (jr jobRunner) HTTPJob(ctx context.Context, monitor *v1.HTTPMonitor, region
 		} else {
 			data.Error = 1
 			data.Message = httpFailureMessage(res, status.IsSuccessful())
-			// Mark the recorded response as errored so OTel emits the error counter
-			// for non-2xx / failed assertions, matching the public checker.
-			lastRes.Error = "Error"
-			if called < int(retry) {
-				return nil, fmt.Errorf("unable to ping: %v with status %v", res, res.Status)
-			}
+			lastRes.Error = data.Message
+			return &data, fmt.Errorf("unable to ping: %v with status %v", res, res.Status)
 		}
 
 		return &data, nil
@@ -260,7 +250,11 @@ func (jr jobRunner) HTTPJob(ctx context.Context, monitor *v1.HTTPMonitor, region
 		otel.RecordHTTPMetrics(ctx, req, lastRes, region)
 	}
 
-	if err != nil {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+	// Exhausted probes are outage data; setup failures are job errors.
+	if err != nil && resp == nil {
 		return nil, err
 	}
 	return resp, nil

@@ -1,7 +1,6 @@
+import { evaluatePageAccess } from "@openstatus/api/src/auth/page-access";
 import { expect } from "@std/expect";
 import { describe, test } from "@std/testing/bdd";
-
-import { evaluateMarkdownGate } from "./evaluate-markdown-gate";
 
 const base = {
   passwordAuthorized: false,
@@ -11,9 +10,9 @@ const base = {
   allowedIpRanges: null,
 } as const;
 
-describe("evaluateMarkdownGate", () => {
+describe("evaluatePageAccess", () => {
   test("public → ok", () => {
-    expect(evaluateMarkdownGate({ ...base, accessType: "public" })).toEqual({
+    expect(evaluatePageAccess({ ...base, accessType: "public" })).toEqual({
       ok: true,
     });
   });
@@ -21,7 +20,7 @@ describe("evaluateMarkdownGate", () => {
   describe("password", () => {
     test("authorized → ok", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "password",
           passwordAuthorized: true,
@@ -31,7 +30,7 @@ describe("evaluateMarkdownGate", () => {
 
     test("not authorized → 401", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "password",
           passwordAuthorized: false,
@@ -43,7 +42,7 @@ describe("evaluateMarkdownGate", () => {
   describe("email-domain", () => {
     test("allowed domain → ok", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "email-domain",
           authEmail: "alice@acme.com",
@@ -54,7 +53,7 @@ describe("evaluateMarkdownGate", () => {
 
     test("no session → 403", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "email-domain",
           authEmailDomains: ["acme.com"],
@@ -64,7 +63,7 @@ describe("evaluateMarkdownGate", () => {
 
     test("wrong domain → 403", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "email-domain",
           authEmail: "bob@evil.com",
@@ -75,7 +74,7 @@ describe("evaluateMarkdownGate", () => {
 
     test("empty authEmailDomains → 403", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "email-domain",
           authEmail: "alice@acme.com",
@@ -88,7 +87,7 @@ describe("evaluateMarkdownGate", () => {
   describe("ip-restriction", () => {
     test("allowed IP → ok", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "ip-restriction",
           clientIp: "10.0.0.5",
@@ -99,7 +98,7 @@ describe("evaluateMarkdownGate", () => {
 
     test("disallowed IP → 403", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "ip-restriction",
           clientIp: "192.168.1.1",
@@ -108,9 +107,9 @@ describe("evaluateMarkdownGate", () => {
       ).toMatchObject({ ok: false, status: 403 });
     });
 
-    test("missing IP → 403 (gap the feed route has, asserted closed)", () => {
+    test("missing IP is denied", () => {
       expect(
-        evaluateMarkdownGate({
+        evaluatePageAccess({
           ...base,
           accessType: "ip-restriction",
           allowedIpRanges: ["10.0.0.0/24"],

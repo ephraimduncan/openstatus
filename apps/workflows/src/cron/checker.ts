@@ -51,6 +51,10 @@ export const isAuthorizedDomain = (url: string) => {
 };
 
 const logger = getLogger("workflow");
+const isSelfHosted = z
+  .stringbool()
+  .prefault("false")
+  .parse(process.env.SELF_HOST);
 
 /**
  * Check if GCP Cloud Tasks is properly configured.
@@ -78,7 +82,7 @@ function isGcpConfigured(): boolean {
 // This allows self-hosted deployments to run without GCP Cloud Tasks
 let client: CloudTasksClient | null = null;
 
-if (isGcpConfigured()) {
+if (!isSelfHosted && isGcpConfigured()) {
   client = new CloudTasksClient({
     // fallback: true,
     projectId: env().GCP_PROJECT_ID,
@@ -92,6 +96,8 @@ if (isGcpConfigured()) {
 export async function sendCheckerTasks(
   periodicity: z.infer<typeof monitorPeriodicitySchema>,
 ): Promise<{ success: number; failed: number }> {
+  if (isSelfHosted) return { success: 0, failed: 0 };
+
   // If GCP Cloud Tasks is not configured, skip task creation
   if (!client) {
     logger.warn("GCP Cloud Tasks not configured - skipping checker tasks", {

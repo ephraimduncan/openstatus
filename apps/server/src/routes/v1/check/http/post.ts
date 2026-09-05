@@ -5,6 +5,7 @@ import { check } from "@openstatus/db/src/schema/check";
 import percentile from "percentile";
 
 import { env } from "@/env";
+import { assertHostedCheckerAvailable } from "@/libs/checker";
 import { openApiErrorResponses } from "@/libs/errors";
 
 import { assertSafeMonitorUrl } from "../../monitors/utils";
@@ -49,6 +50,7 @@ const postRoute = createRoute({
 
 export function registerHTTPPostCheck(api: typeof checkApi) {
   return api.openapi(postRoute, async (c) => {
+    assertHostedCheckerAvailable();
     const data = c.req.valid("json");
     const workspaceId = c.get("workspace").id;
     const input = c.req.valid("json");

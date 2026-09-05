@@ -1,4 +1,4 @@
-import { db, eq, inArray } from "@openstatus/db";
+import { and, db, eq, inArray } from "@openstatus/db";
 import {
   notification,
   notificationTrigger,
@@ -24,7 +24,7 @@ import {
 } from "@openstatus/test-utils";
 
 import { checkerAudit } from "../utils/audit-log";
-import { triggerNotifications } from "./alerting";
+import { enqueueNotifications, triggerNotifications } from "./alerting";
 import { providerToFunction } from "./utils";
 
 // Deno has no module mocking, so we stub the methods on the real singletons
@@ -52,10 +52,14 @@ let mockSlackSendDegraded: AnyStub;
 let mockDiscordSendAlert: AnyStub;
 let mockDiscordSendRecovery: AnyStub;
 let mockDiscordSendDegraded: AnyStub;
+let auditLog: Stub<
+  typeof checkerAudit,
+  Parameters<typeof checkerAudit.publishAuditLog>,
+  Promise<void>
+>;
 
 // Own workspace + monitors: asserting on "how many notifications fired for this
 // monitor" only holds if no other suite can attach one.
-// Unique cronTimestamp per test avoids unique-constraint conflicts.
 let workspaceId: number;
 let emailMonitorId: number;
 let emailNotificationId: number;
@@ -63,10 +67,8 @@ let noNotifMonitorId: number;
 
 beforeEach(() => {
   stubs = [];
-  // biome-ignore lint/suspicious/noExplicitAny: avoid Tinybird call
-  stubs.push(
-    stub(checkerAudit, "publishAuditLog", () => Promise.resolve()) as AnyStub,
-  );
+  auditLog = stub(checkerAudit, "publishAuditLog", () => Promise.resolve());
+  stubs.push(auditLog);
   mockEmailSendAlert = stubSend("email", "sendAlert");
   mockEmailSendRecovery = stubSend("email", "sendRecovery");
   mockEmailSendDegraded = stubSend("email", "sendDegraded");
@@ -102,15 +104,24 @@ await describe("triggerNotifications", async () => {
   test("should send alert notification and return triggered list", async () => {
     const cronTimestamp = 9000001;
 
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(emailMonitorId),
+          statusCode: 500,
+          message: "Internal Server Error",
+          notifType: "alert",
+          cronTimestamp,
+          incidentId: undefined,
+          regions: ["ams"],
+          latency: 1500,
+        },
+        tx,
+      ),
+    );
     const result = await triggerNotifications({
       monitorId: String(emailMonitorId),
-      statusCode: 500,
-      message: "Internal Server Error",
-      notifType: "alert",
       cronTimestamp,
-      incidentId: undefined,
-      regions: ["ams"],
-      latency: 1500,
     });
 
     assertSpyCalls(mockEmailSendAlert, 1);
@@ -124,12 +135,21 @@ await describe("triggerNotifications", async () => {
   test("should send recovery notification and return triggered list", async () => {
     const cronTimestamp = 9000002;
 
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(emailMonitorId),
+          statusCode: 200,
+          notifType: "recovery",
+          cronTimestamp,
+          regions: ["ams"],
+        },
+        tx,
+      ),
+    );
     const result = await triggerNotifications({
       monitorId: String(emailMonitorId),
-      statusCode: 200,
-      notifType: "recovery",
       cronTimestamp,
-      regions: ["ams"],
     });
 
     assertSpyCalls(mockEmailSendRecovery, 1);
@@ -143,13 +163,22 @@ await describe("triggerNotifications", async () => {
   test("should send degraded notification and return triggered list", async () => {
     const cronTimestamp = 9000003;
 
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(emailMonitorId),
+          statusCode: 200,
+          notifType: "degraded",
+          cronTimestamp,
+          latency: 5000,
+          regions: ["ams"],
+        },
+        tx,
+      ),
+    );
     const result = await triggerNotifications({
       monitorId: String(emailMonitorId),
-      statusCode: 200,
-      notifType: "degraded",
       cronTimestamp,
-      latency: 5000,
-      regions: ["ams"],
     });
 
     assertSpyCalls(mockEmailSendDegraded, 1);
@@ -163,11 +192,19 @@ await describe("triggerNotifications", async () => {
   test("should return empty list when monitor has no notifications", async () => {
     const cronTimestamp = 9000004;
 
-    // Monitor 2 has no notifications linked in seed data
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(noNotifMonitorId),
+          statusCode: 500,
+          notifType: "alert",
+          cronTimestamp,
+        },
+        tx,
+      ),
+    );
     const result = await triggerNotifications({
       monitorId: String(noNotifMonitorId),
-      statusCode: 500,
-      notifType: "alert",
       cronTimestamp,
     });
 
@@ -175,30 +212,272 @@ await describe("triggerNotifications", async () => {
     expect(result).toHaveLength(0);
   });
 
-  test("should skip duplicate notification trigger for same cronTimestamp", async () => {
+  test("does not redeliver acknowledged notification intent", async () => {
     const cronTimestamp = 9000005;
 
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(emailMonitorId),
+          statusCode: 500,
+          notifType: "alert",
+          cronTimestamp,
+        },
+        tx,
+      ),
+    );
     const first = await triggerNotifications({
       monitorId: String(emailMonitorId),
-      statusCode: 500,
-      notifType: "alert",
       cronTimestamp,
     });
 
     expect(first).toHaveLength(1);
     assertSpyCalls(mockEmailSendAlert, 1);
 
-    // Same cronTimestamp should be skipped due to unique constraint
     const second = await triggerNotifications({
       monitorId: String(emailMonitorId),
-      statusCode: 500,
-      notifType: "alert",
       cronTimestamp,
     });
-
-    // still only the first call — the duplicate was skipped
     assertSpyCalls(mockEmailSendAlert, 1);
     expect(second).toHaveLength(0);
+  });
+
+  test("keeps rejected delivery pending and drains its stored alert before a later recovery", async () => {
+    mockEmailSendAlert.restore();
+    stubs = stubs.filter((entry) => entry !== mockEmailSendAlert);
+    let reject = true;
+    mockEmailSendAlert = stub(providerToFunction.email, "sendAlert", () =>
+      reject
+        ? Promise.reject(new Error("Provider rejected delivery"))
+        : Promise.resolve(),
+    );
+    stubs.push(mockEmailSendAlert);
+    const input = {
+      monitorId: String(emailMonitorId),
+      statusCode: 500,
+      message: "Original outage",
+      regions: ["Private London"],
+      notifType: "alert" as const,
+      cronTimestamp: 9000006,
+    };
+
+    await db.transaction((tx) => enqueueNotifications(input, tx));
+    await expect(triggerNotifications(input)).rejects.toThrow();
+    assertSpyCalls(mockEmailSendAlert, 4);
+    assertSpyCalls(auditLog, 0);
+    const pending = await db
+      .select()
+      .from(notificationTrigger)
+      .where(
+        and(
+          eq(notificationTrigger.monitorId, emailMonitorId),
+          eq(notificationTrigger.cronTimestamp, input.cronTimestamp),
+        ),
+      )
+      .get();
+    expect(pending?.status).toBe("pending");
+    expect(pending?.leaseToken).toBeNull();
+
+    reject = false;
+    const recovery = {
+      monitorId: String(emailMonitorId),
+      statusCode: 200,
+      notifType: "recovery" as const,
+      cronTimestamp: 9000007,
+      regions: ["Private Paris"],
+    };
+    await db.transaction((tx) => enqueueNotifications(recovery, tx));
+    const delivered = await triggerNotifications(recovery);
+    expect(delivered).toEqual([
+      { notificationId: emailNotificationId, provider: "email" },
+      { notificationId: emailNotificationId, provider: "email" },
+    ]);
+    assertSpyCalls(mockEmailSendAlert, 5);
+    expect(mockEmailSendAlert.calls[4].args[0]).toMatchObject({
+      message: "Original outage",
+      statusCode: 500,
+      regions: ["Private London"],
+      cronTimestamp: 9000006,
+    });
+    assertSpyCalls(mockEmailSendRecovery, 1);
+    expect(auditLog.calls.map((call) => call.args[0])).toMatchObject([
+      { action: "notification.sent", metadata: { type: "alert" } },
+      { action: "notification.sent", metadata: { type: "recovery" } },
+    ]);
+    expect(await triggerNotifications(recovery)).toEqual([]);
+    assertSpyCalls(auditLog, 2);
+  });
+
+  test("does not acknowledge or send a concurrent pending delivery twice", async () => {
+    mockEmailSendAlert.restore();
+    stubs = stubs.filter((entry) => entry !== mockEmailSendAlert);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    mockEmailSendAlert = stub(providerToFunction.email, "sendAlert", () => {
+      started.resolve();
+      return release.promise;
+    });
+    stubs.push(mockEmailSendAlert);
+    const input = {
+      monitorId: String(emailMonitorId),
+      notifType: "alert" as const,
+      cronTimestamp: 9000008,
+    };
+    await db.transaction((tx) => enqueueNotifications(input, tx));
+    const first = triggerNotifications(input);
+    try {
+      await started.promise;
+      await expect(triggerNotifications(input)).rejects.toThrow();
+      assertSpyCalls(mockEmailSendAlert, 1);
+      assertSpyCalls(auditLog, 0);
+    } finally {
+      release.resolve();
+      await first;
+    }
+    expect(await triggerNotifications(input)).toEqual([]);
+    assertSpyCalls(mockEmailSendAlert, 1);
+    assertSpyCalls(auditLog, 1);
+  });
+
+  test("reclaims an expired delivery lease left by an interrupted worker", async () => {
+    const input = {
+      monitorId: String(emailMonitorId),
+      notifType: "degraded" as const,
+      cronTimestamp: 9000009,
+      regions: ["Private London"],
+    };
+    await db.transaction((tx) => enqueueNotifications(input, tx));
+    await db
+      .update(notificationTrigger)
+      .set({
+        leaseToken: "interrupted-worker",
+        leaseExpiresAt: 0,
+      })
+      .where(
+        and(
+          eq(notificationTrigger.monitorId, emailMonitorId),
+          eq(notificationTrigger.cronTimestamp, input.cronTimestamp),
+        ),
+      );
+
+    expect(await triggerNotifications(input)).toEqual([
+      { notificationId: emailNotificationId, provider: "email" },
+    ]);
+    assertSpyCalls(mockEmailSendDegraded, 1);
+    const sent = await db
+      .select()
+      .from(notificationTrigger)
+      .where(
+        and(
+          eq(notificationTrigger.monitorId, emailMonitorId),
+          eq(notificationTrigger.cronTimestamp, input.cronTimestamp),
+        ),
+      )
+      .get();
+    expect(sent?.status).toBe("sent");
+    expect(sent?.leaseToken).toBeNull();
+    expect(await triggerNotifications(input)).toEqual([]);
+    assertSpyCalls(mockEmailSendDegraded, 1);
+  });
+
+  test("does not acknowledge or release a lease taken over by another worker", async () => {
+    const monitor = await createMonitor(workspaceId);
+    await linkNotificationToMonitor(emailNotificationId, monitor.id);
+    const input = {
+      monitorId: String(monitor.id),
+      notifType: "alert" as const,
+      cronTimestamp: 9000011,
+    };
+    const trigger = and(
+      eq(notificationTrigger.monitorId, monitor.id),
+      eq(notificationTrigger.cronTimestamp, input.cronTimestamp),
+    );
+    mockEmailSendAlert.restore();
+    stubs = stubs.filter((entry) => entry !== mockEmailSendAlert);
+    mockEmailSendAlert = stub(
+      providerToFunction.email,
+      "sendAlert",
+      async () => {
+        await db
+          .update(notificationTrigger)
+          .set({
+            leaseToken: "new-worker",
+            leaseExpiresAt: Date.now() + 300_000,
+          })
+          .where(trigger);
+      },
+    );
+    stubs.push(mockEmailSendAlert);
+
+    await db.transaction((tx) => enqueueNotifications(input, tx));
+    await expect(triggerNotifications(input)).rejects.toThrow();
+    const pending = await db
+      .select()
+      .from(notificationTrigger)
+      .where(trigger)
+      .get();
+    expect(pending?.status).toBe("pending");
+    expect(pending?.leaseToken).toBe("new-worker");
+    assertSpyCalls(auditLog, 0);
+  });
+
+  test("does not create notification intent on a same-status replay", async () => {
+    expect(
+      await triggerNotifications({
+        monitorId: String(emailMonitorId),
+        cronTimestamp: 9000010,
+      }),
+    ).toEqual([]);
+    assertSpyCalls(mockEmailSendAlert, 0);
+    assertSpyCalls(auditLog, 0);
+  });
+
+  test("counts only recent acknowledged SMS deliveries and stops at the quota", async () => {
+    const { workspace } = await createTestWorkspace({
+      limits: JSON.stringify({ "sms-limit": 1 }),
+    });
+    const smsMonitor = await createMonitor(workspace.id);
+    const otherMonitor = await createMonitor(workspace.id);
+    const sms = await createNotification(workspace.id, {
+      provider: "sms",
+      data: JSON.stringify({ sms: "+12025550123" }),
+    });
+    await linkNotificationToMonitor(sms.id, smsMonitor.id);
+    const smsSend = stub(providerToFunction.sms, "sendAlert", () =>
+      Promise.resolve(),
+    );
+    stubs.push(smsSend);
+    const now = Date.now();
+    const twoMonthsAgo = new Date(now);
+    twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
+    await db.insert(notificationTrigger).values([
+      {
+        monitorId: smsMonitor.id,
+        notificationId: sms.id,
+        cronTimestamp: twoMonthsAgo.getTime(),
+        status: "sent",
+      },
+      {
+        monitorId: otherMonitor.id,
+        notificationId: sms.id,
+        cronTimestamp: now,
+        status: "pending",
+      },
+    ]);
+    const input = {
+      monitorId: String(smsMonitor.id),
+      cronTimestamp: now,
+      notifType: "alert" as const,
+    };
+    await db.transaction((tx) => enqueueNotifications(input, tx));
+    expect(await triggerNotifications(input)).toEqual([
+      { notificationId: sms.id, provider: "sms" },
+    ]);
+    const next = { ...input, cronTimestamp: now + 1 };
+    await db.transaction((tx) => enqueueNotifications(next, tx));
+    await expect(triggerNotifications(next)).rejects.toThrow();
+    assertSpyCalls(smsSend, 1);
+    assertSpyCalls(auditLog, 1);
   });
 });
 
@@ -269,13 +548,22 @@ describe("triggerNotifications with multiple providers", () => {
 
     const cronTimestamp = 9100001;
 
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(testMonitorId),
+          statusCode: 500,
+          message: "Server Error",
+          notifType: "alert",
+          cronTimestamp,
+          regions: ["ams"],
+        },
+        tx,
+      ),
+    );
     const result = await triggerNotifications({
       monitorId: String(testMonitorId),
-      statusCode: 500,
-      message: "Server Error",
-      notifType: "alert",
       cronTimestamp,
-      regions: ["ams"],
     });
 
     assertSpyCalls(mockSlackSendAlert, 1);
@@ -296,12 +584,21 @@ describe("triggerNotifications with multiple providers", () => {
   test("should trigger recovery on all linked providers", async () => {
     const cronTimestamp = 9100002;
 
+    await db.transaction((tx) =>
+      enqueueNotifications(
+        {
+          monitorId: String(testMonitorId),
+          statusCode: 200,
+          notifType: "recovery",
+          cronTimestamp,
+          regions: ["ams"],
+        },
+        tx,
+      ),
+    );
     const result = await triggerNotifications({
       monitorId: String(testMonitorId),
-      statusCode: 200,
-      notifType: "recovery",
       cronTimestamp,
-      regions: ["ams"],
     });
 
     assertSpyCalls(mockSlackSendRecovery, 1);

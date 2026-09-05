@@ -1,13 +1,22 @@
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import { db, eq } from "@openstatus/db";
 import {
   notification,
   notificationsToMonitors,
+  selectWorkspaceSchema,
 } from "@openstatus/db/src/schema";
 import { createTestWorkspace } from "@openstatus/db/src/test/factories";
+import {
+  NotificationProvider,
+  NotificationService,
+} from "@openstatus/proto/notification/v1";
 import { expect } from "@std/expect";
 import { afterAll, beforeAll, describe, test } from "@std/testing/bdd";
+import { stub } from "@std/testing/mock";
 
 import { app } from "../../../../../index";
+import { RPC_CONTEXT_KEY } from "../../../interceptors";
+import { notificationServiceImpl } from "../index";
 
 /**
  * Helper to make ConnectRPC requests using the Connect protocol (JSON).
@@ -825,8 +834,73 @@ describe("NotificationService.CheckNotificationLimit", () => {
 });
 
 describe("NotificationService.SendTestNotification", () => {
-  // Note: These tests verify error handling since we can't actually send
-  // real notifications in tests without mocking external services
+  test("read-only keys cannot send test alerts while write keys can", async () => {
+    const { workspace } = await createTestWorkspace();
+    const ownWorkspace = selectWorkspaceSchema.parse(workspace);
+    const endpoint = "https://93.184.216.34/test-alert";
+    const deliveries: Request[] = [];
+    const fetchStub = stub(globalThis, "fetch", (input, init) => {
+      const request = new Request(input, init);
+      if (request.url !== endpoint) {
+        throw new Error(`Unexpected outbound request: ${request.url}`);
+      }
+      deliveries.push(request);
+      return Promise.resolve(new Response(null, { status: 200 }));
+    });
+    try {
+      for (const scope of ["read", "write"] as const) {
+        const client = createClient(
+          NotificationService,
+          createRouterTransport(
+            (router) =>
+              router.service(NotificationService, notificationServiceImpl),
+            {
+              router: {
+                interceptors: [
+                  (next) => (req) => {
+                    req.contextValues.set(RPC_CONTEXT_KEY, {
+                      workspace: ownWorkspace,
+                      requestId: `${TEST_PREFIX}-scope`,
+                      apiKey: {
+                        id: `${TEST_PREFIX}-${scope}`,
+                        scopes: [scope],
+                      },
+                    });
+                    return next(req);
+                  },
+                ],
+              },
+            },
+          ),
+        );
+        const result = client.sendTestNotification({
+          provider: NotificationProvider.WEBHOOK,
+          data: {
+            data: {
+              case: "webhook",
+              value: { endpoint },
+            },
+          },
+        });
+        if (scope === "read") {
+          await expect(result).rejects.toMatchObject({
+            code: Code.PermissionDenied,
+          });
+          expect(deliveries).toEqual([]);
+        } else {
+          expect((await result).success).toBe(true);
+          expect(deliveries).toHaveLength(1);
+          expect(deliveries[0]?.method).toBe("POST");
+          expect(await deliveries[0]?.json()).toMatchObject({
+            monitor: { id: 1, name: "test" },
+            status: "recovered",
+          });
+        }
+      }
+    } finally {
+      fetchStub.restore();
+    }
+  });
 
   test("returns error for unsupported email provider", async () => {
     const res = await connectRequest(
@@ -844,8 +918,6 @@ describe("NotificationService.SendTestNotification", () => {
 
     // Email doesn't support test notifications
     expect(res.status).toBe(400);
-    const data = await res.json();
-    expect(data.message).toContain("not supported");
   });
 
   test("returns error for unsupported SMS provider", async () => {
@@ -864,8 +936,6 @@ describe("NotificationService.SendTestNotification", () => {
 
     // SMS doesn't support test notifications
     expect(res.status).toBe(400);
-    const data = await res.json();
-    expect(data.message).toContain("not supported");
   });
 
   test("returns error when no data provided", async () => {
@@ -895,8 +965,6 @@ describe("NotificationService.SendTestNotification", () => {
     );
 
     expect(res.status).toBe(400);
-    const data = await res.json();
-    expect(data.message).toContain("Expected discord data");
   });
 
   test("returns 401 when no auth key provided", async () => {

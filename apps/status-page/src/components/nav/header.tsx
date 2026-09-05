@@ -94,25 +94,11 @@ export function Header({
   });
   const prefix = usePathnamePrefix();
 
-  const sendPageSubscriptionMutation = useMutation(
-    trpc.emailRouter.sendPageSubscriptionVerification.mutationOptions({}),
-  );
-
   const subscribeMutation = useMutation(
     trpc.statusPage.subscribe.mutationOptions({
-      onSuccess: (data) => {
-        if (!data?.id || !data?.token) return;
-        sendPageSubscriptionMutation.mutate(
-          { id: data.id, token: data.token },
-          {
-            onError: (error) => {
-              if (isTRPCClientError(error)) {
-                toast.error(error.message);
-              } else {
-                toast.error(t("Failed to subscribe"));
-              }
-            },
-          },
+      onError: (error) => {
+        toast.error(
+          isTRPCClientError(error) ? error.message : t("Failed to subscribe"),
         );
       },
     }),

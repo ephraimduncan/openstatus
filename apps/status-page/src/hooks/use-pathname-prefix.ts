@@ -13,7 +13,7 @@ export function usePathnamePrefix() {
   const trpc = useTRPC();
   const { domain } = useParams<{ domain: string }>();
   const { data: page } = useQuery({
-    ...trpc.statusPage.get.queryOptions({ slug: domain }),
+    ...trpc.statusPage.getGate.queryOptions({ slug: domain }),
   });
   const locale = useLocale();
   const defaultLocale = page?.defaultLocale || globalDefaultLocale;

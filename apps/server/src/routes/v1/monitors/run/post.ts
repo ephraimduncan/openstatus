@@ -100,6 +100,7 @@ export function registerRunMonitor(api: typeof monitorsApi) {
     const row = parseMonitor.data;
 
     assertLegacyRunnableJobType(row.jobType);
+    const url = getCheckerUrl(row, { data: true });
 
     // Maybe later overwrite the region
 
@@ -142,7 +143,6 @@ export function registerRunMonitor(api: typeof monitorsApi) {
       const status =
         monitorStatus.data.find((m) => region === m.region)?.status || "active";
       const payload = getCheckerPayload(row, status);
-      const url = getCheckerUrl(row, { data: true });
 
       const result = fetch(url, {
         headers: {

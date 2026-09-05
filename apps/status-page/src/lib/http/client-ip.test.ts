@@ -1,7 +1,6 @@
+import { resolveClientIp } from "@openstatus/api/src/auth/client-ip";
 import { expect } from "@std/expect";
 import { describe, test } from "@std/testing/bdd";
-
-import { resolveClientIp } from "./client-ip";
 
 function h(map: Record<string, string>) {
   return { get: (name: string) => map[name] ?? null };

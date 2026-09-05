@@ -238,6 +238,7 @@ export const dnsOutput = z
   );
 
 export async function testHttp(input: z.infer<typeof httpTestInput>) {
+  assertHostedCheckerAvailable();
   // Reject requests to our own domain to avoid loops
   if (input.url.includes("openstatus.dev")) {
     throw new TRPCError({
@@ -338,6 +339,7 @@ export async function testHttp(input: z.infer<typeof httpTestInput>) {
 }
 
 export async function testTcp(input: z.infer<typeof tcpTestInput>) {
+  assertHostedCheckerAvailable();
   try {
     const res = await fetch(
       `https://openstatus-checker.fly.dev/tcp/${input.region}`,
@@ -389,6 +391,7 @@ export async function testTcp(input: z.infer<typeof tcpTestInput>) {
 }
 
 export async function testDns(input: z.infer<typeof dnsTestInput>) {
+  assertHostedCheckerAvailable();
   try {
     const res = await fetch(
       `https://openstatus-checker.fly.dev/dns/${input.region}`,
@@ -459,6 +462,7 @@ export async function testDns(input: z.infer<typeof dnsTestInput>) {
 }
 
 export async function testIcmp(input: z.infer<typeof icmpTestInput>) {
+  assertHostedCheckerAvailable();
   try {
     const res = await fetch(
       `https://openstatus-checker.fly.dev/icmp/${input.region}`,
@@ -513,6 +517,7 @@ export async function testIcmp(input: z.infer<typeof icmpTestInput>) {
 }
 
 export async function testGrpc(input: z.infer<typeof grpcTestInput>) {
+  assertHostedCheckerAvailable();
   try {
     const res = await fetch(
       `https://openstatus-checker.fly.dev/grpc/${input.region}`,
@@ -590,6 +595,7 @@ export async function testGrpc(input: z.infer<typeof grpcTestInput>) {
 export async function triggerChecker(
   input: z.infer<typeof selectMonitorSchema>,
 ) {
+  assertHostedCheckerAvailable();
   let payload:
     | z.infer<typeof httpPayloadSchema>
     | z.infer<typeof tpcPayloadSchema>
@@ -743,6 +749,15 @@ function generateUrl({ row }: { row: z.infer<typeof selectMonitorSchema> }) {
       return `https://openstatus-checker.fly.dev/checker/grpc?monitor_id=${row.id}`;
     default:
       throw new Error("Invalid jobType");
+  }
+}
+
+function assertHostedCheckerAvailable() {
+  if (z.stringbool().prefault("false").parse(process.env.SELF_HOST)) {
+    throw new TRPCError({
+      code: "PRECONDITION_FAILED",
+      message: "Hosted checks are unavailable on self-hosted instances",
+    });
   }
 }
 

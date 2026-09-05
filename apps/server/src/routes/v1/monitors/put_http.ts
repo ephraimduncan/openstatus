@@ -126,7 +126,7 @@ export function registerPutHTTPMonitor(api: typeof monitorsApi) {
           : undefined,
         otelEndpoint: openTelemetry?.endpoint,
         assertions: assert ? serialize(assert) : "",
-        timeout: input.timeout || 45000,
+        timeout: input.timeout,
         updatedAt: new Date(),
       })
       .where(eq(monitor.id, Number(_monitor.id)))

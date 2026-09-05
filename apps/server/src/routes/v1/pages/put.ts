@@ -29,7 +29,15 @@ const putRoute = createRoute({
       description: "The monitor to update",
       content: {
         "application/json": {
-          schema: PageSchema.omit({ id: true }).partial(),
+          schema: PageSchema.omit({ id: true })
+            // The nonoptional layer makes partial skip defaults on omitted fields.
+            .required({
+              accessType: true,
+              passwordProtected: true,
+              showMonitorValues: true,
+              authEmailDomains: true,
+            })
+            .partial(),
         },
       },
     },
@@ -172,9 +180,19 @@ export function registerPutPage(api: typeof pagesApi) {
       .update(page)
       .set({
         ...rest,
-        customDomain: input.customDomain ?? "",
+        customDomain:
+          "customDomain" in input ? (input.customDomain ?? "") : undefined,
         accessType:
-          rest.accessType ?? (rest.passwordProtected ? "password" : "public"),
+          rest.accessType ??
+          (rest.passwordProtected === undefined
+            ? undefined
+            : rest.passwordProtected
+              ? "password"
+              : "public"),
+        passwordProtected:
+          rest.accessType === undefined
+            ? rest.passwordProtected
+            : rest.accessType === "password",
         authEmailDomains: rest.authEmailDomains?.join(","),
         updatedAt: new Date(),
       })
@@ -197,7 +215,7 @@ export function registerPutPage(api: typeof pagesApi) {
     );
 
     // Delete removed monitors from pageComponent
-    if (removedMonitorIds.length) {
+    if (monitors !== undefined && removedMonitorIds.length) {
       await db
         .delete(pageComponent)
         .where(

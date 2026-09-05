@@ -1,14 +1,30 @@
 import { and, db, eq, isNotNull, isNull } from "@openstatus/db";
 import {
   incidentTable,
+  maintenance,
   monitor,
   page,
   pageComponent,
   pageSubscriber,
+  statusReport,
+  statusReportUpdate,
   workspace,
 } from "@openstatus/db/src/schema";
+import {
+  createMonitor,
+  createPage,
+  createPageComponent,
+  createTestWorkspace,
+} from "@openstatus/db/src/test/factories";
 import { expect } from "@std/expect";
 import { afterAll, beforeAll, describe, test } from "@std/testing/bdd";
+import { stub } from "@std/testing/mock";
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import { NextRequest } from "next/server";
+
+import { createTRPCContext, createTRPCRouter } from "../trpc";
+import { pageSubscriberRouter } from "./pageSubscriber";
+import { statusPageRouter } from "./statusPage";
 
 /**
  * End-to-end integration tests for the full unsubscribe flow.
@@ -1692,5 +1708,302 @@ describe("statusPage exposes page component names, not internal monitor names", 
 
     expect(result?.name).toBe(componentName);
     expect(result?.description).toBe(componentDescription);
+  });
+});
+
+describe("status-page access and signup HTTP boundaries", () => {
+  const router = createTRPCRouter({
+    statusPage: statusPageRouter,
+    pageSubscriber: pageSubscriberRouter,
+  });
+  let protectedPage: typeof page.$inferSelect;
+  let protectedMonitor: typeof monitor.$inferSelect;
+  let protectedComponent: typeof pageComponent.$inferSelect;
+  let reportId: number;
+  let maintenanceId: number;
+
+  beforeAll(async () => {
+    const { workspace: owner } = await createTestWorkspace();
+    protectedPage = await createPage(owner.id, {
+      accessType: "password",
+      password: "page-secret",
+      customDomain: `private-${crypto.randomUUID()}.example.com`,
+      configuration: { type: "manual", value: "manual" },
+    });
+    protectedMonitor = await createMonitor(owner.id, {
+      name: "private-monitor",
+      jobType: "udp",
+      public: true,
+      active: true,
+    });
+    protectedComponent = await createPageComponent(owner.id, protectedPage.id, {
+      name: "private-component",
+      type: "monitor",
+      monitorId: protectedMonitor.id,
+    });
+    await db.insert(incidentTable).values({
+      workspaceId: owner.id,
+      monitorId: protectedMonitor.id,
+      title: "private-incident",
+    });
+    const report = await db
+      .insert(statusReport)
+      .values({
+        workspaceId: owner.id,
+        pageId: protectedPage.id,
+        status: "investigating",
+        title: "private-report",
+      })
+      .returning()
+      .get();
+    reportId = report.id;
+    await db.insert(statusReportUpdate).values({
+      statusReportId: report.id,
+      status: "investigating",
+      date: new Date(),
+      message: "private-update",
+    });
+    const scheduled = await db
+      .insert(maintenance)
+      .values({
+        workspaceId: owner.id,
+        pageId: protectedPage.id,
+        title: "private-maintenance",
+        message: "private-work",
+        from: new Date(),
+        to: new Date(Date.now() + 60_000),
+      })
+      .returning()
+      .get();
+    maintenanceId = scheduled.id;
+  });
+
+  async function request(
+    path: string,
+    input: Record<string, unknown>,
+    options: {
+      headers?: HeadersInit;
+      password?: string;
+      email?: string;
+      mutation?: boolean;
+    } = {},
+  ) {
+    const url = new URL(`http://localhost/trpc/${path}`);
+    const payload = JSON.stringify({ json: input });
+    if (!options.mutation) url.searchParams.set("input", payload);
+    if (options.password !== undefined) {
+      url.searchParams.set("pw", options.password);
+    }
+    const headers = new Headers(options.headers);
+    if (options.mutation) headers.set("content-type", "application/json");
+    const req = new NextRequest(url, {
+      headers,
+      method: options.mutation ? "POST" : "GET",
+      body: options.mutation ? payload : undefined,
+    });
+    const response = await fetchRequestHandler({
+      endpoint: "/trpc",
+      req,
+      router,
+      createContext: () =>
+        createTRPCContext({
+          req,
+          auth: async () =>
+            options.email ? { user: { email: options.email } } : null,
+        }),
+    });
+    return { status: response.status, body: await response.text() };
+  }
+
+  test("every content procedure denies password pages before returning data", async () => {
+    const inputs = [
+      ["get", {}],
+      ["getLight", {}],
+      ["getMonitors", {}],
+      ["getMonitor", { id: protectedMonitor.id }],
+      ["getReport", { id: reportId }],
+      ["getMaintenance", { id: maintenanceId }],
+      ["getUptime", { pageComponentIds: [String(protectedComponent.id)] }],
+    ] as const;
+    for (const [procedure, input] of inputs) {
+      const denied = await request(
+        `statusPage.${procedure}`,
+        {
+          slug: protectedPage.slug,
+          ...input,
+        },
+        { headers: { "x-trpc-source": "rsc" } },
+      );
+      expect(denied.status).toBe(401);
+      expect(denied.body).not.toContain("private-");
+    }
+    const metadata = await request("statusPage.getGate", {
+      slug: protectedPage.slug,
+    });
+    expect(metadata.status).toBe(200);
+    expect(metadata.body).toContain('"accessType":"password"');
+    expect(metadata.body).not.toContain("page-secret");
+    expect(metadata.body).not.toContain("private-component");
+    expect(metadata.body).not.toContain("private-report");
+    expect(metadata.body).not.toContain('"createdAt"');
+  });
+
+  test("password cookies authorize canonical and custom domains but wrong query passwords win", async () => {
+    const headers = { cookie: `secured-${protectedPage.slug}=page-secret` };
+    const authorized = await request(
+      "statusPage.get",
+      {
+        slug: protectedPage.customDomain,
+      },
+      { headers },
+    );
+    expect(authorized.status).toBe(200);
+    expect(authorized.body).toContain("private-component");
+    expect(authorized.body).toContain("private-report");
+    expect(authorized.body).toContain("private-update");
+    expect(authorized.body).toContain("private-maintenance");
+    expect(authorized.body).not.toContain("page-secret");
+    const denied = await request(
+      "statusPage.get",
+      {
+        slug: protectedPage.slug,
+      },
+      { headers, password: "wrong" },
+    );
+    expect(denied.status).toBe(401);
+    const byQuery = await request(
+      "statusPage.getMonitor",
+      {
+        slug: protectedPage.slug,
+        id: protectedMonitor.id,
+      },
+      { password: "page-secret" },
+    );
+    expect(byQuery.status).toBe(200);
+    expect(byQuery.body).toContain("private-component");
+  });
+
+  test("email access requires the authenticated session, not caller headers", async () => {
+    await db
+      .update(page)
+      .set({
+        accessType: "email-domain",
+        authEmailDomains: "EXAMPLE.COM",
+      })
+      .where(eq(page.id, protectedPage.id));
+    try {
+      for (const email of [undefined, "other@elsewhere.test"]) {
+        const denied = await request(
+          "statusPage.get",
+          {
+            slug: protectedPage.slug,
+          },
+          {
+            email,
+            headers: {
+              "x-auth-email": "member@example.com",
+              "x-trpc-source": "rsc",
+            },
+          },
+        );
+        expect(denied.status).toBe(403);
+        expect(denied.body).not.toContain("private-component");
+      }
+      const authorized = await request(
+        "statusPage.get",
+        {
+          slug: protectedPage.slug,
+        },
+        { email: "Member@Example.com" },
+      );
+      expect(authorized.status).toBe(200);
+      expect(authorized.body).toContain("private-report");
+    } finally {
+      await db
+        .update(page)
+        .set({ accessType: "password" })
+        .where(eq(page.id, protectedPage.id));
+    }
+  });
+
+  test("public pages remain readable without a session or password", async () => {
+    await db
+      .update(page)
+      .set({ accessType: "public" })
+      .where(eq(page.id, protectedPage.id));
+    try {
+      const result = await request("statusPage.get", {
+        slug: protectedPage.slug,
+      });
+      expect(result.status).toBe(200);
+      expect(result.body).toContain("private-component");
+      expect(result.body).toContain("private-report");
+    } finally {
+      await db
+        .update(page)
+        .set({ accessType: "password" })
+        .where(eq(page.id, protectedPage.id));
+    }
+  });
+
+  test("both signup routes return no verification capability and send the usable token only by email", async () => {
+    const emailBodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    using _transport = stub(globalThis, "fetch", async (input, init) => {
+      const outgoing = new Request(input, init);
+      if (
+        ["localhost", "127.0.0.1", "[::1]"].includes(
+          new URL(outgoing.url).hostname,
+        )
+      ) {
+        return originalFetch(outgoing);
+      }
+      if (new URL(outgoing.url).hostname !== "api.resend.com") {
+        throw new Error(`Unexpected network request: ${outgoing.url}`);
+      }
+      emailBodies.push(await outgoing.text());
+      return Response.json({ id: "local-email-id" });
+    });
+    for (const path of ["statusPage.subscribe", "pageSubscriber.upsert"]) {
+      const email = `${crypto.randomUUID()}@example.com`;
+      const input =
+        path === "statusPage.subscribe"
+          ? {
+              slug: protectedPage.slug,
+              email,
+              subscribeComponents: false,
+              pageComponents: [],
+            }
+          : { pageId: protectedPage.id, email };
+      const result = await request(path, input, { mutation: true });
+      expect(result.status).toBe(200);
+      const subscriber = await db.query.pageSubscriber.findFirst({
+        where: and(
+          eq(pageSubscriber.pageId, protectedPage.id),
+          eq(pageSubscriber.email, email),
+        ),
+      });
+      if (!subscriber?.token)
+        throw new Error("Signup did not create a verification token");
+      expect(subscriber.acceptedAt).toBeNull();
+      expect(result.body).not.toContain(subscriber.token);
+      expect(result.body).not.toContain('"token"');
+      expect(emailBodies.at(-1)).toContain(email);
+      expect(emailBodies.at(-1)).toContain(`/verify/${subscriber.token}`);
+      const verified = await request(
+        "pageSubscriber.verify",
+        {
+          token: subscriber.token,
+          domain: protectedPage.slug,
+        },
+        { mutation: true },
+      );
+      expect(verified.status).toBe(200);
+      const accepted = await db.query.pageSubscriber.findFirst({
+        where: eq(pageSubscriber.id, subscriber.id),
+      });
+      expect(accepted?.acceptedAt).toBeInstanceOf(Date);
+    }
+    expect(emailBodies).toHaveLength(2);
   });
 });

@@ -1,12 +1,27 @@
 import { expect } from "@std/expect";
-import { afterEach, describe, test } from "@std/testing/bdd";
+import { afterEach, beforeEach, describe, test } from "@std/testing/bdd";
+import { stub } from "@std/testing/mock";
 
-import { testGrpc } from "./checker";
+import {
+  testDns,
+  testGrpc,
+  testHttp,
+  testIcmp,
+  testTcp,
+  triggerChecker,
+} from "./checker";
 
 const originalFetch = globalThis.fetch;
+const originalSelfHost = process.env.SELF_HOST;
+
+beforeEach(() => {
+  process.env.SELF_HOST = "false";
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalSelfHost === undefined) delete process.env.SELF_HOST;
+  else process.env.SELF_HOST = originalSelfHost;
 });
 
 /** Stub the checker with one canned JSON body. */
@@ -107,4 +122,63 @@ describe("testGrpc", () => {
       testGrpc({ url: "api.example.com:443", tls: "tls", region: "ams" }),
     ).rejects.toThrow("uri not reachable");
   });
+});
+
+test("self-hosted checks never send credentials or monitor data to hosted checkers", async () => {
+  process.env.SELF_HOST = "true";
+  using fetchStub = stub(globalThis, "fetch", () =>
+    Promise.resolve(Response.json({ state: "error", message: "blocked" })),
+  );
+  const monitor: Parameters<typeof triggerChecker>[0] = {
+    id: 1,
+    workspaceId: 1,
+    jobType: "http",
+    name: "private-monitor",
+    externalName: null,
+    description: "",
+    url: "https://example.com/private",
+    method: "POST",
+    headers: [{ key: "Authorization", value: "Bearer private-token" }],
+    body: "private-monitor-body",
+    assertions: null,
+    periodicity: "1m",
+    status: "active",
+    active: true,
+    public: false,
+    regions: ["ams"],
+    timeout: 1000,
+    degradedAfter: null,
+    retry: 0,
+    followRedirects: false,
+    grpcService: null,
+    grpcTls: "tls",
+    otelEndpoint: null,
+    otelHeaders: [],
+    createdAt: null,
+    updatedAt: null,
+    deletedAt: null,
+  };
+  const checks = [
+    () =>
+      testHttp({
+        url: monitor.url,
+        method: "POST",
+        region: "ams",
+        headers: monitor.headers,
+        body: monitor.body,
+        assertions: [],
+      }),
+    () => testTcp({ url: "example.com:443", region: "ams" }),
+    () => testDns({ url: "example.com", region: "ams", assertions: [] }),
+    () => testIcmp({ url: "example.com", region: "ams" }),
+    () => testGrpc({ url: "example.com:443", region: "ams", tls: "tls" }),
+    () => triggerChecker(monitor),
+  ];
+
+  for (const check of checks) {
+    await expect(check()).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+  }
+  expect(fetchStub.calls).toHaveLength(0);
 });

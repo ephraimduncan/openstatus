@@ -13,6 +13,7 @@ import {
   upsertSelfSignupSubscriber,
   verifySelfSignupSubscriber,
 } from "@openstatus/services/page-subscriber";
+import { sendEmailVerification } from "@openstatus/subscriptions";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
@@ -78,6 +79,24 @@ export const pageSubscriberRouter = createTRPCRouter({
             componentIds: opts.input.componentIds,
           },
         });
+
+        if (!subscription.acceptedAt) {
+          if (!subscription.token) {
+            throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+          }
+          const verifyUrl = subscription.customDomain
+            ? `https://${subscription.customDomain}/verify/${subscription.token}`
+            : `https://${subscription.pageSlug}.openstatus.dev/verify/${subscription.token}`;
+          await sendEmailVerification(
+            {
+              ...subscription,
+              token: subscription.token,
+              acceptedAt: undefined,
+              unsubscribedAt: undefined,
+            },
+            verifyUrl,
+          );
+        }
 
         return {
           success: true,

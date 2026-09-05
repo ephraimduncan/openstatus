@@ -1,3 +1,5 @@
+import { db, eq } from "@openstatus/db";
+import { monitorRun } from "@openstatus/db/src/schema";
 import { afterEach, expect, mock, test } from "@openstatus/test-utils";
 
 import { app } from "@/index";
@@ -56,6 +58,7 @@ test("run monitor with valid id should return 200", async () => {
 });
 
 test("run monitor with no-wait parameter should return empty array", async () => {
+  mockFetch.mockResolvedValue(new Response(null, { status: 200 }));
   const res = await app.request("/v1/monitor/1/run?no-wait=true", {
     method: "POST",
     headers: {
@@ -142,47 +145,69 @@ test("run TCP monitor with valid id should return 200", async () => {
   }
 });
 
-test.ignore(
-  "run monitor with multiple regions should return array of results",
-  async () => {
-    mockFetch.mockReturnValue(
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jobType: "http",
-            status: 200,
-            latency: 100,
-            region: "ams",
-            timestamp: 1234567890,
-            timing: {
-              dnsStart: 1,
-              dnsDone: 2,
-              connectStart: 3,
-              connectDone: 4,
-              tlsHandshakeStart: 5,
-              tlsHandshakeDone: 6,
-              firstByteStart: 7,
-              firstByteDone: 8,
-              transferStart: 9,
-              transferDone: 10,
-            },
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        ),
+test.skip("run monitor with multiple regions should return array of results", async () => {
+  mockFetch.mockReturnValue(
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          jobType: "http",
+          status: 200,
+          latency: 100,
+          region: "ams",
+          timestamp: 1234567890,
+          timing: {
+            dnsStart: 1,
+            dnsDone: 2,
+            connectStart: 3,
+            connectDone: 4,
+            tlsHandshakeStart: 5,
+            tlsHandshakeDone: 6,
+            firstByteStart: 7,
+            firstByteDone: 8,
+            transferStart: 9,
+            transferDone: 10,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
       ),
-    );
+    ),
+  );
 
-    const res = await app.request("/v1/monitor/5/run", {
-      method: "POST",
-      headers: {
-        "x-openstatus-key": "1",
-        "content-type": "application/json",
-      },
-    });
+  const res = await app.request("/v1/monitor/5/run", {
+    method: "POST",
+    headers: {
+      "x-openstatus-key": "1",
+      "content-type": "application/json",
+    },
+  });
 
-    expect(res.status).toBe(200);
+  expect(res.status).toBe(200);
 
-    const json = await res.json();
-    expect(Array.isArray(json)).toBe(true);
-  },
-);
+  const json = await res.json();
+  expect(Array.isArray(json)).toBe(true);
+});
+
+test("self-hosted run and trigger reject before consuming quota", async () => {
+  const previous = process.env.SELF_HOST;
+  const before = await db
+    .select()
+    .from(monitorRun)
+    .where(eq(monitorRun.monitorId, 1));
+  process.env.SELF_HOST = "true";
+  try {
+    for (const endpoint of ["run", "trigger"]) {
+      const response = await app.request(`/v1/monitor/1/${endpoint}`, {
+        method: "POST",
+        headers: { "x-openstatus-key": "1" },
+      });
+      expect(response.status).toBe(403);
+    }
+    expect(
+      await db.select().from(monitorRun).where(eq(monitorRun.monitorId, 1)),
+    ).toEqual(before);
+    expect(mockFetch).not.toHaveBeenCalled();
+  } finally {
+    if (previous === undefined) delete process.env.SELF_HOST;
+    else process.env.SELF_HOST = previous;
+  }
+});

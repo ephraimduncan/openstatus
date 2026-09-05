@@ -3,6 +3,7 @@ import {
   monitor,
   monitorStatusTable,
   privateLocation,
+  privateLocationMonitorStatus,
   privateLocationToMonitors,
 } from "@openstatus/db/src/schema";
 import { expect } from "@std/expect";
@@ -117,6 +118,136 @@ describe("getMonitorStatus", () => {
         { region: "ams", status: "active" },
         { region: "iad", status: "error" },
       ]);
+    });
+  });
+
+  test("returns private health without public regions and combines both when configured", async () => {
+    await withTestTransaction(async (tx) => {
+      const ctx = { ...teamCtx, db: tx };
+      const row = await createMonitor({
+        ctx,
+        input: {
+          name: `${TEST_PREFIX}-private-status`,
+          jobType: "http",
+          url: "https://example.com",
+          method: "GET",
+          headers: [],
+          assertions: [],
+          active: false,
+          regions: [],
+        },
+      });
+      const [location] = await tx
+        .insert(privateLocation)
+        .values({
+          workspaceId: teamCtx.workspace.id,
+          name: `${TEST_PREFIX}-private-status-pl`,
+          token: `${TEST_PREFIX}-private-status-token`,
+        })
+        .returning();
+      await tx.insert(privateLocationToMonitors).values([
+        { monitorId: row.id, privateLocationId: location.id },
+        { monitorId: row.id, privateLocationId: location.id },
+      ]);
+      await tx.insert(privateLocationMonitorStatus).values({
+        monitorId: row.id,
+        privateLocationId: location.id,
+        status: "error",
+        cronTimestamp: 1_700_000_000_000,
+      });
+
+      expect(
+        await getMonitorStatus({ ctx, input: { monitorId: row.id } }),
+      ).toEqual({
+        id: row.id,
+        regions: [{ region: String(location.id), status: "error" }],
+      });
+
+      await tx
+        .update(monitor)
+        .set({ regions: "ams" })
+        .where(eq(monitor.id, row.id));
+      await tx.insert(monitorStatusTable).values({
+        monitorId: row.id,
+        region: "ams",
+        status: "degraded",
+      });
+      expect(
+        await getMonitorStatus({ ctx, input: { monitorId: row.id } }),
+      ).toEqual({
+        id: row.id,
+        regions: [
+          { region: "ams", status: "degraded" },
+          { region: String(location.id), status: "error" },
+        ],
+      });
+    });
+  });
+
+  test("excludes detached, deleted, foreign, and other-monitor private status", async () => {
+    await withTestTransaction(async (tx) => {
+      const ctx = { ...teamCtx, db: tx };
+      const row = await createMonitor({
+        ctx,
+        input: {
+          name: `${TEST_PREFIX}-private-status-scope`,
+          jobType: "http",
+          url: "https://example.com",
+          method: "GET",
+          headers: [],
+          assertions: [],
+          active: false,
+          regions: [],
+        },
+      });
+      const [other] = await tx
+        .insert(monitor)
+        .values({
+          workspaceId: teamCtx.workspace.id,
+          name: `${TEST_PREFIX}-other-status-monitor`,
+          url: "https://example.com",
+        })
+        .returning();
+      const [detached, deleted, foreign, attached] = await tx
+        .insert(privateLocation)
+        .values(
+          ["detached", "deleted", "foreign", "attached"].map((name) => ({
+            workspaceId:
+              name === "foreign" ? freeCtx.workspace.id : teamCtx.workspace.id,
+            name: `${TEST_PREFIX}-${name}-status-pl`,
+            token: `${TEST_PREFIX}-${name}-status-token`,
+          })),
+        )
+        .returning();
+      await tx.insert(privateLocationToMonitors).values([
+        { monitorId: other.id, privateLocationId: detached.id },
+        {
+          monitorId: row.id,
+          privateLocationId: deleted.id,
+          deletedAt: new Date(),
+        },
+        { monitorId: row.id, privateLocationId: foreign.id },
+        { monitorId: row.id, privateLocationId: attached.id },
+        { monitorId: other.id, privateLocationId: attached.id },
+      ]);
+      await tx.insert(privateLocationMonitorStatus).values([
+        ...[detached, deleted, foreign].map((location) => ({
+          monitorId: row.id,
+          privateLocationId: location.id,
+          status: "error" as const,
+          cronTimestamp: 1_700_000_000_000,
+        })),
+        {
+          monitorId: other.id,
+          privateLocationId: attached.id,
+          status: "error",
+          cronTimestamp: 1_700_000_000_000,
+        },
+      ]);
+
+      expect(
+        await getMonitorStatus({ ctx, input: { monitorId: row.id } }),
+      ).toEqual({ id: row.id, regions: [] });
     });
   });
 });

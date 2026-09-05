@@ -28,7 +28,7 @@ export function Footer({
   const [isMounted, setIsMounted] = useState(false);
   const trpc = useTRPC();
   const { data: page, dataUpdatedAt } = useQuery({
-    ...trpc.statusPage.get.queryOptions({ slug: domain }),
+    ...trpc.statusPage.getGate.queryOptions({ slug: domain }),
   });
   const embed = useEmbed();
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;

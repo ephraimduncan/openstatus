@@ -1,103 +1,131 @@
 import { getLogger } from "@logtape/logtape";
-import { and, db, eq, inArray, isNull, schema } from "@openstatus/db";
+import { and, eq, isNull, schema } from "@openstatus/db";
+import type { MonitorStatus } from "@openstatus/db/src/schema";
+import type { DrizzleTx } from "@openstatus/services";
 
 import { checkerAudit } from "../utils/audit-log";
 
 const logger = getLogger(["workflow"]);
 
-/**
- * Finds an open incident (not resolved) for the given monitor.
- */
-export async function findOpenIncident(monitorId: number) {
-  return db
-    .select()
-    .from(schema.incidentTable)
-    .where(
-      and(
-        eq(schema.incidentTable.monitorId, monitorId),
-        isNull(schema.incidentTable.resolvedAt),
-      ),
-    )
-    .get();
-}
+type Incident = typeof schema.incidentTable.$inferSelect;
 
-/**
- * Finds all open incidents (not resolved) for the given monitor.
- */
-export async function findAllOpenIncidents(monitorId: number) {
-  return db
-    .select()
-    .from(schema.incidentTable)
-    .where(
-      and(
-        eq(schema.incidentTable.monitorId, monitorId),
-        isNull(schema.incidentTable.resolvedAt),
-      ),
-    )
-    .all();
-}
+export type StatusChange = {
+  changed: boolean;
+  incidentId: number | undefined;
+  incidents: Incident[];
+};
 
-/**
- * Resolves all open incidents by setting resolvedAt and autoResolved flag.
- * Uses a single atomic bulk update to prevent partial state on failures.
- * Returns array of successfully resolved incidents.
- */
-export async function resolveIncident(params: {
-  monitorId: string;
+/** Keep aggregate status and incident state in the caller's result transaction. */
+export async function applyMonitorStatus({
+  tx,
+  monitor,
+  status,
+  cronTimestamp,
+}: {
+  tx: DrizzleTx;
+  monitor: Pick<
+    typeof schema.monitor.$inferSelect,
+    "id" | "workspaceId" | "status"
+  >;
+  status: MonitorStatus;
   cronTimestamp: number;
-}): Promise<(typeof schema.incidentTable.$inferSelect)[]> {
-  const { monitorId, cronTimestamp } = params;
-
-  // Find ALL open incidents for this monitor
-  const incidents = await findAllOpenIncidents(Number(monitorId));
-
-  if (incidents.length === 0) {
-    return []; // No open incidents
+}): Promise<StatusChange> {
+  const changed = monitor.status !== status;
+  if (changed) {
+    await tx
+      .update(schema.monitor)
+      .set({ status })
+      .where(eq(schema.monitor.id, monitor.id));
   }
 
-  // Extract all incident IDs for bulk update
-  const incidentIds = incidents.map((i) => i.id);
+  const openIncident = and(
+    eq(schema.incidentTable.monitorId, monitor.id),
+    isNull(schema.incidentTable.resolvedAt),
+  );
 
-  // ATOMIC BULK UPDATE: Resolve all incidents in a single query
-  // This prevents partial state if operation fails midway
-  const resolvedIncidents = await db
+  // Same-status reports can finish an interrupted transition from older writers.
+  if (status === "error") {
+    const existing = await tx
+      .select()
+      .from(schema.incidentTable)
+      .where(openIncident)
+      .get();
+    if (existing) {
+      return { changed, incidentId: existing.id, incidents: [] };
+    }
+    const incidents = await tx
+      .insert(schema.incidentTable)
+      .values({
+        monitorId: monitor.id,
+        workspaceId: monitor.workspaceId,
+        startedAt: new Date(cronTimestamp),
+      })
+      .returning();
+    return { changed: true, incidentId: incidents[0]?.id, incidents };
+  }
+
+  const incidents = await tx
     .update(schema.incidentTable)
-    .set({
-      resolvedAt: new Date(cronTimestamp),
-      autoResolved: true,
-    })
-    .where(
-      and(
-        inArray(schema.incidentTable.id, incidentIds),
-        isNull(schema.incidentTable.resolvedAt), // Still prevents race conditions
-      ),
-    )
+    .set({ resolvedAt: new Date(cronTimestamp), autoResolved: true })
+    .where(openIncident)
     .returning();
+  return {
+    changed: changed || incidents.length > 0,
+    incidentId: incidents[0]?.id,
+    incidents,
+  };
+}
 
-  // Emit audit logs for each resolved incident
-  // These are best-effort; failure here doesn't affect data integrity
-  for (const incident of resolvedIncidents) {
-    logger.info("Recovered incident", {
-      incident_id: incident.id,
-      monitor_id: monitorId,
-    });
-
-    try {
+/** Tinybird is best-effort and must only run after the database commits. */
+export async function publishStatusAudit({
+  monitorId,
+  status,
+  region,
+  cronTimestamp,
+  statusCode,
+  message,
+  latency,
+  incidents = [],
+}: {
+  monitorId: string;
+  status: MonitorStatus;
+  region: string;
+  cronTimestamp: number;
+  statusCode?: number;
+  message?: string;
+  latency?: number;
+  incidents?: Incident[];
+}): Promise<void> {
+  try {
+    for (const incident of incidents) {
       await checkerAudit.publishAuditLog({
         id: `monitor:${monitorId}`,
-        action: "incident.resolved",
+        action: status === "error" ? "incident.created" : "incident.resolved",
         targets: [{ id: monitorId, type: "monitor" }],
         metadata: { cronTimestamp, incidentId: incident.id },
       });
-    } catch (error) {
-      logger.error("Failed to publish audit log for incident resolution", {
-        incident_id: incident.id,
-        monitor_id: monitorId,
-        error,
-      });
-      // Don't throw - incident is already resolved
     }
+    await checkerAudit.publishAuditLog({
+      id: `monitor:${monitorId}`,
+      action:
+        status === "error"
+          ? "monitor.failed"
+          : status === "degraded"
+            ? "monitor.degraded"
+            : "monitor.recovered",
+      targets: [{ id: monitorId, type: "monitor" }],
+      metadata: {
+        region,
+        statusCode: statusCode ?? -1,
+        cronTimestamp,
+        latency,
+        ...(status === "error" ? { message } : {}),
+      },
+    });
+  } catch (error) {
+    logger.error("Failed to publish status audit log", {
+      monitor_id: monitorId,
+      error,
+    });
   }
-
-  return resolvedIncidents;
 }

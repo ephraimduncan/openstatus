@@ -6,6 +6,8 @@ RUN apk add --no-cache tzdata
 ENV TZ=UTC
 
 ENV CGO_ENABLED=0
+ARG TARGETOS
+ARG TARGETARCH
 
 COPY go.* .
 RUN go mod download

@@ -1,13 +1,26 @@
-import { afterEach, expect, mock, test } from "@openstatus/test-utils";
+import {
+  afterEach,
+  beforeEach,
+  expect,
+  mock,
+  test,
+} from "@openstatus/test-utils";
 
 import { app } from "@/index";
 
 const mockFetch = mock();
+const originalSelfHost = process.env.SELF_HOST;
+
+beforeEach(() => {
+  process.env.SELF_HOST = "false";
+});
 
 global.fetch = mockFetch as unknown as typeof fetch;
 
 afterEach(() => {
   mockFetch.mockReset();
+  if (originalSelfHost === undefined) delete process.env.SELF_HOST;
+  else process.env.SELF_HOST = originalSelfHost;
 });
 
 test("Create a single check  ", async () => {
@@ -230,4 +243,26 @@ test("Create a multiple check", async () => {
       },
     },
   });
+});
+
+test("self-hosted HTTP checks reject before sending credentials or request data", async () => {
+  process.env.SELF_HOST = "true";
+  const res = await app.request("/v1/check/http", {
+    method: "POST",
+    headers: {
+      "x-openstatus-key": "1",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      url: "https://example.com/private",
+      regions: ["ams"],
+      method: "POST",
+      headers: [{ key: "Authorization", value: "Bearer private-token" }],
+      body: "private-monitor-body",
+    }),
+  });
+
+  expect(res.status).toBe(403);
+  expect(await res.json()).toMatchObject({ code: "FORBIDDEN" });
+  expect(mockFetch).not.toHaveBeenCalled();
 });

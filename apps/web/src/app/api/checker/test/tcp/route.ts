@@ -18,6 +18,10 @@ export function GET() {
 
 export async function POST(request: Request) {
   try {
+    if (z.stringbool().prefault("false").parse(process.env.SELF_HOST)) {
+      return NextResponse.json({ success: false }, { status: 403 });
+    }
+
     const json = await request.json();
     const _valid = tcpPayload
       .pick({ url: true })

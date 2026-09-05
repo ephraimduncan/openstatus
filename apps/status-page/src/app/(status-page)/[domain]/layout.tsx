@@ -5,10 +5,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { PasswordWrapper } from "../../../components/password-wrapper";
-import {
-  FloatingButton,
-  StatusPageProvider,
-} from "../../../components/status-page/floating-button";
+import { StatusPageProvider } from "../../../components/status-page/floating-button";
 import { FloatingTheme } from "../../../components/status-page/floating-theme";
 import { ThemeProvider } from "../../../components/themes/theme-provider";
 import { statusPageAlternates } from "../../../lib/alternates";
@@ -27,7 +24,7 @@ export default async function Layout({
   const queryClient = getQueryClient();
   const { domain } = await params;
   const page = await queryClient.fetchQuery(
-    trpc.statusPage.get.queryOptions({ slug: domain }),
+    trpc.statusPage.getGate.queryOptions({ slug: domain }),
   );
 
   if (!page) return notFound();
@@ -70,12 +67,6 @@ export default async function Layout({
           customTheme={page.customTheme}
         >
           {children}
-          <FloatingButton
-            pageId={page?.id}
-            // NOTE: token to avoid showing the floating button to random users
-            // timestamp is our token - it is hard to guess
-            token={page?.createdAt?.getTime().toString()}
-          />
           <FloatingTheme />
           <Toaster
             toastOptions={{
@@ -100,7 +91,7 @@ export async function generateMetadata({
   const queryClient = getQueryClient();
   const { domain } = await params;
   const page = await queryClient.fetchQuery(
-    trpc.statusPage.get.queryOptions({ slug: domain }),
+    trpc.statusPage.getGate.queryOptions({ slug: domain }),
   );
 
   if (!page) return notFound();
@@ -112,9 +103,10 @@ export async function generateMetadata({
       default: page?.title,
     },
     description: page?.description,
-    robots: page?.allowIndex
-      ? { index: true, follow: true }
-      : { index: false, follow: false },
+    robots:
+      page.accessType === "public" && page.allowIndex
+        ? { index: true, follow: true }
+        : { index: false, follow: false },
     icons: page?.icon?.toLowerCase().endsWith(".svg")
       ? { icon: { url: page.icon, type: "image/svg+xml" } }
       : page?.icon,

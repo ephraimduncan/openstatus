@@ -1,6 +1,6 @@
 import { db, sql } from "@openstatus/db";
 import { page } from "@openstatus/db/src/schema";
-import { cookies, headers } from "next/headers";
+import { TRPCError } from "@trpc/server";
 import { type NextRequest, NextResponse } from "next/server";
 
 import {
@@ -11,13 +11,10 @@ import {
 } from "../../../../content/status-json";
 import { getBaseUrl } from "../../../../lib/base-url";
 import { stripHostPort } from "../../../../lib/domain";
-import { resolveClientIp } from "../../../../lib/http/client-ip";
 import { computeETag, isNotModified } from "../../../../lib/http/etag";
-import { resolveGate } from "../../../../lib/proxy/resolve-gate";
 import { resolveRoute } from "../../../../lib/resolve-route";
-import { getQueryClient, trpc } from "../../../../lib/trpc/server";
+import { createStatusPageCaller } from "../../../../lib/trpc/server";
 
-// trpc httpBatchLink needs Node, matching the markdown route.
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -26,6 +23,7 @@ function json(body: unknown, status: number, extraHeaders?: HeadersInit) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
       ...extraHeaders,
     },
   });
@@ -64,23 +62,9 @@ export async function GET(
       .get();
     if (!row) return json({ error: "Not Found" }, 404);
 
-    const queryClient = getQueryClient();
-    const data = await queryClient.fetchQuery(
-      trpc.statusPage.get.queryOptions({ slug: row.slug }),
-    );
+    const caller = await createStatusPageCaller(request);
+    const data = await caller.get({ slug: row.slug });
     if (!data) return json({ error: "Not Found" }, 404);
-
-    const headerStore = await headers();
-    const cookieStore = await cookies();
-    const clientIp = resolveClientIp(headerStore);
-    const gate = await resolveGate({
-      page: data,
-      queryClient,
-      url,
-      cookieStore,
-      clientIp,
-    });
-    if (!gate.ok) return json({ error: gate.body }, gate.status);
 
     const baseUrl = getBaseUrl({
       slug: data.slug,
@@ -121,6 +105,11 @@ export async function GET(
       },
     });
   } catch (error) {
+    if (error instanceof TRPCError) {
+      if (error.code === "UNAUTHORIZED")
+        return json({ error: "Unauthorized" }, 401);
+      if (error.code === "FORBIDDEN") return json({ error: "Forbidden" }, 403);
+    }
     console.error("Error serving status-page status JSON:", error);
     return json({ error: "Internal Server Error" }, 500);
   }

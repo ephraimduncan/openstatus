@@ -1,10 +1,11 @@
+import { isPasswordAuthorized } from "@openstatus/api/src/auth/access-predicates";
+import { resolveClientIp } from "@openstatus/api/src/auth/client-ip";
+import { createProtectedCookieKey } from "@openstatus/api/src/auth/protected";
 import { db, sql } from "@openstatus/db";
 import { page, selectPageSchema } from "@openstatus/db/src/schema";
 import { NextResponse } from "next/server";
 
 import { auth } from "./lib/auth";
-import { resolveClientIp } from "./lib/http/client-ip";
-import { createProtectedCookieKey } from "./lib/protected";
 import { applyPageLocaleOverride } from "./lib/proxy/apply-page-locale-override";
 import { applyPageSlugPrefix } from "./lib/proxy/apply-page-slug-prefix";
 import { composePageAction } from "./lib/proxy/compose-page-action";
@@ -17,7 +18,8 @@ const isSelfHosted = process.env.SELF_HOST === "true";
 
 export default auth(async (req) => {
   const url = req.nextUrl.clone();
-  const passthroughResponse = NextResponse.next();
+  let passthroughResponse = NextResponse.next();
+  let passwordCookie: { name: string; value: string } | undefined;
 
   // HTML and markdown share the same URL (negotiated by Accept) — tell shared
   // caches to key on it so a markdown variant is never served to a browser.
@@ -26,11 +28,24 @@ export default auth(async (req) => {
 
   // HTML served via internal rewrite shares its URL with the markdown variant —
   // carry the same Vary as the passthrough so caches don't cross them.
-  const rewriteWithVary = (target: URL) => {
-    const response = NextResponse.rewrite(target);
+  const withAccessHeaders = (response: NextResponse) => {
     response.headers.set("Vary", "Accept");
+    if (passwordCookie) {
+      response.cookies.set(passwordCookie.name, passwordCookie.value, {
+        path: "/",
+        maxAge: 30 * 24 * 60 * 60,
+        sameSite: "lax",
+        secure: req.nextUrl.protocol === "https:",
+      });
+    }
     return response;
   };
+  const rewriteWithVary = (target: URL) =>
+    withAccessHeaders(
+      NextResponse.rewrite(target, {
+        request: { headers: new Headers(req.headers) },
+      }),
+    );
 
   // `/` is the theme explorer, so a host that resolves to no page must 404
   // rather than fall through to it.
@@ -134,13 +149,34 @@ export default auth(async (req) => {
     url: action.url?.toString() ?? null,
   });
 
+  const queryPassword = url.searchParams.get("pw");
+  if (
+    _page.accessType === "password" &&
+    queryPassword !== null &&
+    isPasswordAuthorized({
+      stored: _page.password,
+      queryPassword,
+      cookiePassword: undefined,
+    })
+  ) {
+    passwordCookie = {
+      name: createProtectedCookieKey(_page.slug),
+      value: queryPassword,
+    };
+    // RSC reads the forwarded cookie; the browser receives it before client queries.
+    req.cookies.set(passwordCookie.name, passwordCookie.value);
+    passthroughResponse = NextResponse.next({
+      request: { headers: new Headers(req.headers) },
+    });
+  }
+
   switch (action.type) {
     case "redirect":
-      return NextResponse.redirect(action.url);
+      return withAccessHeaders(NextResponse.redirect(action.url));
     case "rewrite":
       return rewriteWithVary(action.url);
     case "passthrough":
-      return passthroughResponse;
+      return withAccessHeaders(passthroughResponse);
   }
 });
 

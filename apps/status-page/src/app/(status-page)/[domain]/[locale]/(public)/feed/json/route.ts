@@ -1,47 +1,20 @@
-import { notFound, unauthorized } from "next/navigation";
+import { TRPCError } from "@trpc/server";
+import { notFound } from "next/navigation";
+import type { NextRequest } from "next/server";
 
-import { auth } from "../../../../../../../lib/auth";
-import { getQueryClient, trpc } from "../../../../../../../lib/trpc/server";
+import { createStatusPageCaller } from "../../../../../../../lib/trpc/server";
 
-export const revalidate = 60;
+export const dynamic = "force-dynamic";
 
 export async function GET(
-  _request: Request,
+  request: NextRequest,
   props: { params: Promise<{ domain: string }> },
 ) {
   try {
-    const queryClient = getQueryClient();
+    const caller = await createStatusPageCaller(request);
     const { domain } = await props.params;
 
-    const _page = await queryClient.fetchQuery(
-      trpc.statusPage.getLight.queryOptions({ slug: domain }),
-    );
-
-    if (!_page) return notFound();
-
-    if (_page.accessType === "password") {
-      const url = new URL(_request.url);
-      const authorized = await queryClient.fetchQuery(
-        trpc.statusPage.isPasswordAuthorized.queryOptions({
-          slug: _page.slug,
-          queryPassword: url.searchParams.get("pw"),
-        }),
-      );
-      if (!authorized) return unauthorized();
-    }
-
-    if (_page.accessType === "email-domain") {
-      const session = await auth();
-      const user = session?.user;
-      const allowedDomains = _page.authEmailDomains ?? [];
-      if (!user || !user.email) return unauthorized();
-      if (!allowedDomains.includes(user.email.split("@")[1]))
-        return unauthorized();
-    }
-
-    const page = await queryClient.fetchQuery(
-      trpc.statusPage.get.queryOptions({ slug: domain }),
-    );
+    const page = await caller.get({ slug: domain });
 
     if (!page) return notFound();
 
@@ -113,9 +86,25 @@ export async function GET(
     return new Response(JSON.stringify(res), {
       headers: {
         "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control":
+          page.accessType === "public"
+            ? "public, max-age=60"
+            : "private, no-store",
       },
     });
   } catch (error) {
+    if (
+      error instanceof TRPCError &&
+      (error.code === "UNAUTHORIZED" || error.code === "FORBIDDEN")
+    ) {
+      return new Response(
+        error.code === "UNAUTHORIZED" ? "Unauthorized" : "Forbidden",
+        {
+          status: error.code === "UNAUTHORIZED" ? 401 : 403,
+          headers: { "Cache-Control": "no-store" },
+        },
+      );
+    }
     console.error("Error generating feed:", error);
     throw error;
   }

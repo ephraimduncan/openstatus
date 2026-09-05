@@ -185,6 +185,14 @@ type CheckRegionRequest = {
 export async function checkRegion(
   props: CheckRegionRequest,
 ): Promise<RegionCheckerResponse> {
+  if (z.stringbool().prefault("false").parse(process.env.SELF_HOST)) {
+    return {
+      state: "error",
+      region: props.region,
+      message: "Hosted checks are unavailable on self-hosted instances",
+    };
+  }
+
   const { url, region, method, headers, body, signal } = props;
   const regionInfo = regionDict[region];
 
